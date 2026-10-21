@@ -1,0 +1,123 @@
+# PLAY DOT — Android App
+
+Native Kotlin + Jetpack Compose client for the `moviebox-internal-api` backend.
+Display name: **PLAY DOT**. Package ID: `com.streambox.mobile` (kept stable for updates).
+
+## Screens
+
+| Screen | Source |
+|---|---|
+| Splash | Supplied full Play Dot logo |
+| Home | `GET /trending`, `GET /home?page=1` |
+| Search | `GET /search?q=` (debounced) |
+| Detail (movie/series) | `GET /detail/{id}`, `GET /episodes/{id}` |
+| Watchlist | Local DataStore only |
+| Player | `GET /stream/{id}` via Media3/ExoPlayer, local resume progress |
+
+## Build
+
+Requirements: JDK 17, Android SDK 35 (`local.properties`), Gradle wrapper 8.10.2.
+
+```bash
+cd android-app
+
+# Debug APK using adb reverse for a physical device (no LAN IP in the app)
+adb reverse tcp:8000 tcp:8000
+./gradlew :app:assembleDebug -Pstreambox.baseUrl=http://127.0.0.1:8000/
+
+# Signed verification release against a local emulator backend
+./gradlew :app:assembleRelease -Pstreambox.baseUrl=http://10.0.2.2:8101/
+
+# Production release: use the real Render HTTPS origin and keep the trailing /
+./gradlew :app:assembleRelease -Pstreambox.baseUrl=https://<service-name>.onrender.com/
+
+# Verification
+./gradlew :app:testDebugUnitTest :app:lintDebug
+```
+
+Outputs:
+
+- `app/build/outputs/apk/debug/app-debug.apk`
+- `app/build/outputs/apk/release/app-release.apk`
+
+The backend default for emulator builds is `http://10.0.2.2:8000/`. Without
+`-Pstreambox.baseUrl`, that is baked in. Builds are not configured to reach a
+production server automatically.
+
+## Signing
+
+- **Debug:** AGP's standard debug keystore (`~/.android/debug.keystore`).
+  Debug APKs are debuggable and are for development only.
+- **Release:** signed from `keystore.properties` plus `playdot-release.keystore`
+  in this directory. Both are git-ignored (mode 600). The keystore password is
+  never placed in the APK.
+- Back up `playdot-release.keystore` and `keystore.properties` somewhere safe.
+  Losing the release key means future releases cannot update an installed
+  release build; the app must be uninstalled first.
+- If `keystore.properties` is absent, `assembleRelease` produces an unsigned
+  APK. That is intentional: there is no implicit fallback to the debug key.
+
+## Install / update
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+# or
+adb install -r app/build/outputs/apk/release/app-release.apk
+```
+
+- Debug and release APKs have **different signing keys**. Switching between
+  them requires `adb uninstall com.streambox.mobile` and therefore erases local
+  watchlist/progress (`android:allowBackup="false"`).
+- Updates with the same signing key and an equal/higher `versionCode` install
+  with `-r` normally. If Android says "App not installed", check for a signature
+  mismatch or version downgrade before assuming APK corruption.
+- A sideloaded APK may be scanned by Play Protect. Use the signed release build
+  for normal use; do not disable Play Protect or device security to force an
+  install.
+
+## Networking / security
+
+- Manifest permission: `INTERNET` only. `ACCESS_NETWORK_STATE` is pulled in
+  transitively by AndroidX/Coil and is a normal permission.
+- No app-authored services, background receivers, WebView, analytics, or
+  dynamic code loading.
+- `network_security_config.xml` permits cleartext HTTP only for the standard
+  emulator host `10.0.2.2` and loopback (`localhost`/`127.0.0.1`). All other
+  hosts require HTTPS. TLS verification is never disabled.
+- For a physical-device local test, use `adb reverse tcp:8000 tcp:8000` and build
+  with `http://127.0.0.1:8000/`; do not add a developer machine's LAN IP to the
+  app.
+- Provider credentials remain on the backend. No backend `.env` values are
+  compiled into the APK.
+- The backend's `session_id` cookie is kept in an in-memory OkHttp cookie jar.
+  It is not written to disk. This avoids creating a new server/provider session
+  for every screen, while the backend still bounds idle sessions by TTL and
+  maximum count.
+- For deployment and production URL injection, see
+  [`../docs/RENDER_DEPLOYMENT_GUIDE.md`](../docs/RENDER_DEPLOYMENT_GUIDE.md).
+
+## Brand assets
+
+- Launcher: adaptive icon (v26 + v33 monochrome), round variants, and legacy
+  density PNGs generated from the supplied symbol PNG.
+- Splash: supplied full logo (`drawable-nodpi/play_dot_logo.png`) at its original
+  aspect ratio.
+- Palette: violet `#6954FB`, blue `#0D7EFA`, mid `#4363F9`, obsidian background
+  `#06070B` — sampled from the supplied artwork.
+
+## Architecture
+
+```
+app/src/main/java/com/streambox/mobile/
+├── data/
+│   ├── remote/                 # Retrofit service + DTOs
+│   ├── repo/ContentRepository  # Result wrappers + error taxonomy
+│   └── local/                  # DataStore watchlist/progress, resume policy
+├── ui/
+│   ├── theme/                  # dark-only brand theme, type, shapes
+│   ├── components/             # cards, rails, skeletons, error/empty states
+│   ├── screens/{home,search,detail,watchlist,splash}/
+│   ├── player/                 # PlayerScreen + PlayerViewModel (Media3)
+│   └── navigation/StreamBoxNavHost.kt
+└── MainActivity.kt, StreamBoxApplication.kt
+```

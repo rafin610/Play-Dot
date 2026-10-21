@@ -1,0 +1,16 @@
+# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+captures/
+
+# Local SDK path (per-machine; never committed)
+local.properties
+
+# Release signing material (never commit; back these up securely)
+keystore.properties
+*.keystore
+*.jks

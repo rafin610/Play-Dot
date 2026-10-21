@@ -2,13 +2,25 @@ import json
 import os
 from .utils import generate_client_token, get_default_client_info, md5_hex
 
-DEFAULT_GUEST_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1aWQiOjcwNjU5NDg0MTAyMTM4MTYyMzIsInV0cCI6MSwiZXhwIjoxNzkxNzMyMjMzLCJpYXQiOjE3ODM5NTU5MzN9.7iyEzTj4vWAbOF0oXwNnZ0p3Nc1QaO6K9eMiGFyVfGs"
+
+def default_guest_token() -> str:
+    """Shared guest credential, loaded from the local environment (.env).
+
+    Never hardcoded in source: see .env.example for the expected variable.
+    """
+    return os.getenv("MOVIEBOX_GUEST_TOKEN", "")
+
+
+def default_user_id() -> str:
+    """User ID paired with MOVIEBOX_GUEST_TOKEN (local, non-secret config)."""
+    return os.getenv("MOVIEBOX_USER_ID", "")
+
 
 class MovieBoxAuth:
     def __init__(self, token: str = None, user_id: str = None):
-        self.token = token or DEFAULT_GUEST_TOKEN
-        self.user_id = user_id or "7065948410213816232"
-        self.is_logged_in = True
+        self.token = token if token is not None else default_guest_token()
+        self.user_id = user_id or default_user_id()
+        self.is_logged_in = bool(self.token)
         self.is_guest_mode = True
         self.client_info = get_default_client_info()
         self.user_info = None
@@ -16,9 +28,9 @@ class MovieBoxAuth:
 
     def login_guest(self):
         """Perform guest login (Reset back to anonymous state)."""
-        self.token = DEFAULT_GUEST_TOKEN
-        self.user_id = "7065948410213816232"
-        self.is_logged_in = True
+        self.token = default_guest_token()
+        self.user_id = default_user_id()
+        self.is_logged_in = bool(self.token)
         self.is_guest_mode = True
         self.user_info = None
 

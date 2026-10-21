@@ -52,7 +52,7 @@ For requests going to the Android BFF endpoints, the server validates a signatur
    [CANONICAL_PATH_AND_QUERY]
    ```
 4. **Sign the Canonical String**:
-   * Decode the base64-encoded Gateway Secret Key (Default: `76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O`, Alt: `Xqn2nnO41/L92o1iuXhSLHTbXvY4Z5ZZ62m8mSLA`).
+   * Decode the base64-encoded Gateway Secret Key (Default: `<MOVIEBOX_GATEWAY_SECRET-from-local-.env>`, Alt: `<alt-gateway-secret redacted; set locally if required>`).
    * Sign the UTF-8 bytes of the Canonical String using **HMAC-MD5** with the decoded key.
 5. **Format Signature**: Concatenate the signature timestamp, format version (`2`), and base64-encoded signature digest:
    `x-tr-signature: timestamp_ms + "|2|" + base64_encode(hmac_md5_digest)`
@@ -179,11 +179,14 @@ In newer versions, the API deliberately attempts to trap unofficial clients and 
 
 ## 4. Internal Secrets (Static)
 Discovered via `AndroidManifest.xml` and Smali string decryption.
-*   **Gateway Secret**: `76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O` (Used for sign calculation in some clusters).
-*   **ByteDance Gecko / Pangle SDK Access Key**: `f36c832c8dbb162c49b46a7a6dd47fbd` (Used during Pangle/Gecko dynamic asset loader initialization)
-*   **Transsion WeFeed Service Secret**: `df70dbad6215444ca9e87ee1078cc681`
-*   **Transsion BuzzBox Service Secret**: `a6b574246ecb4ab99cd00f74a621743a`
-*   **Transsion Online Course Service Secret**: `c63c7b2a952c42ab9d5e3fccf0e213bf`
+*   **Gateway Secret**: `<MOVIEBOX_GATEWAY_SECRET-from-local-.env>` (Used for sign calculation in some clusters).
+*   **ByteDance Gecko / Pangle SDK Access Key**: `<redacted; rotate if needed>` (Used during Pangle/Gecko dynamic asset loader initialization)
+*   **Transsion WeFeed Service Secret**: `<redacted; rotate if needed>`
+*   **Transsion BuzzBox Service Secret**: `<redacted; rotate if needed>`
+*   **Transsion Online Course Service Secret**: `<redacted; rotate if needed>`
+
+> These values were previously committed to this repository's history. Redacting
+> them here does not remove history; rotate any credential that is still active.
 
 ---
 

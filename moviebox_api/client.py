@@ -1,6 +1,7 @@
 import requests
 import json
 import logging
+import os
 import time
 from typing import Optional, Dict, Any
 from urllib.parse import urlencode, urlparse
@@ -10,6 +11,11 @@ from .auth import MovieBoxAuth
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+def _appid() -> str:
+    """Provider appid used in gateway headers, loaded from the environment (.env)."""
+    return os.getenv("MOVIEBOX_APPID", "")
+
 
 class MovieBoxClient:
     BASE_URL = "https://apig.inmoviebox.com"
@@ -41,7 +47,10 @@ class MovieBoxClient:
             "X-Play-Mode": "2"
         }
         # Fixed appid to match gateway_sdk initialization parameter and removed appkey (which causes 440)
-        headers["appid"] = "4U01pxRu278GqCZKY9"
+        appid = _appid()
+        if not appid:
+            logger.error("MOVIEBOX_APPID is not configured; provider may reject requests.")
+        headers["appid"] = appid
         headers["region"] = "IN"
         headers["lang"] = "en"
         headers["os"] = "android"
@@ -67,7 +76,7 @@ class MovieBoxClient:
             payload["authType"] = 0
             
         res = self.request("POST", "/wefeed-mobile-bff/user-api/get-sms-code", data=payload)
-        logger.info(f"OTP Response: {res}")
+        logger.info("OTP request completed: status=%s", res.get("code") if isinstance(res, dict) else "invalid")
         
         # API might return code 0 or 200 for success
         if res.get("code") in [200, 0]:
@@ -92,7 +101,7 @@ class MovieBoxClient:
             payload["authType"] = 0
             
         res = self.request("POST", "/wefeed-mobile-bff/user-api/login", data=payload)
-        logger.info(f"Login Response: {res}")
+        logger.info("Login request completed: status=%s", res.get("code") if isinstance(res, dict) else "invalid")
         
         if res.get("code") in [200, 0] and "data" in res:
             data = res["data"]
@@ -128,7 +137,7 @@ class MovieBoxClient:
             payload["authType"] = 0
             
         res = self.request("POST", "/wefeed-mobile-bff/user-api/register", data=payload)
-        logger.info(f"Register Response: {res}")
+        logger.info("Register request completed: status=%s", res.get("code") if isinstance(res, dict) else "invalid")
         
         if res.get("code") in [200, 0] and "data" in res:
             data = res["data"]
@@ -283,7 +292,7 @@ class MovieBoxClient:
                     token = user_data.get("token")
                     user_id = user_data.get("userId")
                     if token:
-                        logger.info(f"Dynamically updated session token from response header: {token[:30]}... UID: {user_id}")
+                        logger.info("Guest/session token refreshed from response header")
                         self.auth.update_session(token, user_id, user_data)
                 except Exception as ex:
                     logger.error(f"Failed to parse x-user header: {ex}")

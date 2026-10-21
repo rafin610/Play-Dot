@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import base64
+import os
 import time
 import json
 from typing import Union, Optional
@@ -8,7 +9,21 @@ from urllib.parse import urlparse, parse_qsl, urlencode, quote
 import logging
 logger = logging.getLogger(__name__)
 
-GATEWAY_SECRET_ONLINE = "76iRl07s0xSN9jqmEWAt79EBJZulIQIsV64FZr2O"
+
+def _gateway_secret() -> str:
+    """Gateway HMAC secret, loaded from the local environment (.env).
+
+    Never hardcoded in source: see .env.example for the expected variable.
+    """
+    secret = os.getenv("MOVIEBOX_GATEWAY_SECRET", "")
+    if not secret:
+        logger.error(
+            "MOVIEBOX_GATEWAY_SECRET is not configured; request signing will fail. "
+            "Set it in the local .env file."
+        )
+    return secret
+
+GATEWAY_SECRET_ONLINE = _gateway_secret()
 
 def md5_hex(data: Union[str, bytes]) -> str:
     """Calculates MD5 hash of string or bytes and returns hex string."""
@@ -78,10 +93,14 @@ def generate_tr_signature(method: str, url: str, body_data: str = "", timestamp:
         resource
     ]
     canonical_string = "\n".join(canonical_list)
-    logger.info(f"CANONICAL STRING:\n{canonical_string}")
+    # Never log the canonical string: its query/path values may contain signed
+    # provider parameters. Keep request signing silent.
     
     # App base64 decodes the secret key (Online Secret)
-    key = base64.b64decode(GATEWAY_SECRET_ONLINE)
+    secret = _gateway_secret()
+    if not secret:
+        raise RuntimeError("MOVIEBOX_GATEWAY_SECRET is not configured in the environment")
+    key = base64.b64decode(secret)
     h = hmac.new(key, canonical_string.encode('utf-8'), hashlib.md5)
     
     # App base64 encodes the binary signature result

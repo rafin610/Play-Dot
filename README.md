@@ -6,7 +6,12 @@ A high-performance, browser-native streaming dashboard that reverse-engineers th
 
 ## 📱 Native Android Client
 
-For a native mobile experience, check out [Genga-World](https://github.com/solo12345689/Genga-World) — a native Android application built using Jetpack Compose that integrates with this internal API to deliver the streaming platform on mobile devices.
+The audited Jetpack Compose client is in [`android-app/`](android-app/) and targets
+this backend. It builds signed release APKs with a backend URL injected at build
+time (no production URL is hardcoded).
+
+The older [Genga-World](https://github.com/solo12345689/Genga-World) project is a
+separate Android client and is not the APK audited here.
 
 ---
 
@@ -46,7 +51,7 @@ FastAPI Backend (localhost:8000)   ◄──► MovieBox/AOneRoom API Servers
 
 ### Prerequisites
 
-- **Python 3.10+** — for the backend
+- **Python 3.12.3** — the audited/pinned backend runtime (see `.python-version`)
 - **Node.js 18+** — for the frontend
 - **FFMPEG** — must be in system PATH (for H.265 transcoding and downloads)
   ```
@@ -73,6 +78,14 @@ npm run dev -- --port 3001
 ```
 
 Frontend runs on **http://localhost:3001**
+
+### Production backend / Android build
+
+A Render Blueprint is provided in `render.yaml`; it is prepared but not
+deployed, and automatic deploys are disabled. Follow
+[`docs/RENDER_DEPLOYMENT_GUIDE.md`](docs/RENDER_DEPLOYMENT_GUIDE.md) for secret
+setup, health checks, rollback, and building the Android release APK against the
+actual HTTPS origin. Do not invent or commit a Render URL.
 
 ---
 

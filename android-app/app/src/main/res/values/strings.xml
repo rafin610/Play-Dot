@@ -1,0 +1,19 @@
+<resources>
+    <string name="app_name">PLAY DOT</string>
+    <string name="tab_home">Home</string>
+    <string name="tab_search">Search</string>
+    <string name="tab_watchlist">Watchlist</string>
+    <string name="retry">Retry</string>
+    <string name="error_generic">Something went wrong. Please try again.</string>
+    <string name="search_hint">Search movies &amp; series</string>
+    <string name="error_search_title">Search failed</string>
+    <string name="empty_search_title">No results found</string>
+    <string name="empty_search_message">Try a different title or check the spelling.</string>
+    <string name="empty_watchlist_title">Your watchlist is empty</string>
+    <string name="empty_watchlist_message">Add movies and series from their detail pages.</string>
+    <string name="error_home_title">Could not load content</string>
+    <string name="error_detail_title">Could not load details</string>
+    <string name="play_coming_soon">Playback arrives in Phase 3</string>
+    <string name="season">Season</string>
+    <string name="trending_now">Trending Now</string>
+</resources>

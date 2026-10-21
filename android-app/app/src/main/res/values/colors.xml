@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Play Dot palette. Accent values are sampled from the supplied logo artwork:
+      violet #6954FB (symbol left), blue #0D7EFA (symbol point), mid #4363F9 (dot).
+    -->
+    <color name="app_background">#06070B</color>
+    <color name="app_surface">#0E1117</color>
+    <color name="app_surface_high">#161A22</color>
+    <color name="app_surface_higher">#202530</color>
+    <color name="app_outline">#2C3340</color>
+
+    <color name="app_accent_violet">#6954FB</color>
+    <color name="app_accent_blue">#0D7EFA</color>
+    <color name="app_accent_mid">#4363F9</color>
+    <color name="app_accent">#6954FB</color>
+    <color name="app_accent_deep">#4B36C9</color>
+
+    <color name="app_text_primary">#F4F6FB</color>
+    <color name="app_text_secondary">#A2ABBB</color>
+    <color name="app_text_muted">#66707E</color>
+
+    <color name="app_error">#FF6B6B</color>
+    <color name="app_success">#67D1A5</color>
+
+    <!-- Launcher icon background, sampled from the supplied symbol artwork. -->
+    <color name="ic_launcher_background">#06060A</color>
+</resources>

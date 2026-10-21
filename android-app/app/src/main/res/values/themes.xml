@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Play Dot: dark-only cinematic shell; Compose owns the in-app theme. -->
+    <style name="Theme.PlayDot" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/app_background</item>
+        <item name="android:statusBarColor">@color/app_background</item>
+        <item name="android:navigationBarColor">@color/app_background</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- Manifest keeps pointing here; brand colours live in Theme.PlayDot. -->
+    <style name="Theme.StreamBox" parent="Theme.PlayDot" />
+</resources>
