@@ -221,6 +221,13 @@ browse-and-detail only.
 
 Secrets are never printed to backend logs (Phase 1 redacted token/cookie logging).
 
+Guest JWTs expire after ~90 days. Rotate the token and its paired user ID with
+`.venv/bin/python scripts/refresh_guest_token.py`; `/health` exposes
+`guest_token.expires_at` / `expires_in_days` and warns during the last 7 days.
+An expired seed token is recoverable at runtime (each session bootstraps an
+anonymous token through the `x-user` header), but requests made with an expired
+bearer are sent anonymously so the gateway can issue a replacement.
+
 ## 6. Running locally
 
 ```bash

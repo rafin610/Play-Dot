@@ -6,7 +6,10 @@ without claiming that the real MovieBox provider is available. Live integration
 checks are documented separately in docs/FINAL_AUDIT_REPORT.md.
 """
 
+import base64
+import json
 import os
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -14,6 +17,13 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 import moviebox_api_server as server
+
+
+def fake_jwt(exp: int) -> str:
+    """Unsigned JWT-shaped token whose only meaningful claim is `exp`."""
+    payload = base64.urlsafe_b64encode(json.dumps({"exp": exp}).encode()).decode().rstrip("=")
+    return f"eyJhbGciOiJIUzI1NiJ9.{payload}.signature"
+from tests.test_auth_expiry import fake_jwt
 
 
 LONG_DUB_ID = "8078269238353584824"
@@ -363,6 +373,45 @@ class ConfigurationAndSecurityTest(unittest.TestCase):
             response = self.client.get("/health")
         self.assertEqual(200, response.status_code)
         self.assertEqual("ok", response.json()["status"])
+
+    def test_health_reports_fresh_guest_token_expiry(self):
+        token = fake_jwt(int(time.time()) + 30 * 86400)
+        with patch.dict(
+            os.environ,
+            {
+                "MOVIEBOX_GUEST_TOKEN": token,
+                "MOVIEBOX_USER_ID": "fixture-user",
+                "MOVIEBOX_GATEWAY_SECRET": "Zml4dHVyZQ==",
+                "MOVIEBOX_APPID": "fixture-app",
+            },
+        ):
+            response = self.client.get("/health")
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertFalse(payload["guest_token"]["expired"])
+        self.assertNotIn("warnings", payload)
+        self.assertNotIn(token, response.text)
+
+    def test_expired_guest_token_is_a_warning_not_a_failure(self):
+        token = fake_jwt(int(time.time()) - 60)
+        with patch.dict(
+            os.environ,
+            {
+                "MOVIEBOX_GUEST_TOKEN": token,
+                "MOVIEBOX_USER_ID": "fixture-user",
+                "MOVIEBOX_GATEWAY_SECRET": "Zml4dHVyZQ==",
+                "MOVIEBOX_APPID": "fixture-app",
+            },
+        ):
+            response = self.client.get("/health")
+        # A stale seed token is recoverable (anonymous bootstrap), so health
+        # stays 200 and reports a rotation warning instead of failing the deploy.
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertTrue(payload["guest_token"]["expired"])
+        self.assertTrue(any("MOVIEBOX_GUEST_TOKEN" in item for item in payload["warnings"]))
+        self.assertIn("refresh_guest_token.py", payload["warnings"][0])
+        self.assertNotIn(token, response.text)
 
     def test_missing_configuration_blocks_provider_routes(self):
         with patch.dict(

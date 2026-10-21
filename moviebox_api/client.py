@@ -214,7 +214,17 @@ class MovieBoxClient:
     def request(self, method: str, endpoint: str, params: Optional[Dict] = None, data: Any = None, **kwargs) -> Dict:
         if params is None:
             params = {}
-        
+
+        # Provider guest JWTs expire (the seeded one lasts 90 days). Drop an
+        # expired bearer so this request goes out anonymously; the gateway then
+        # returns a fresh token in the x-user response header below.
+        if self.auth.is_logged_in and self.auth.is_token_expired():
+            logger.warning("Provider bearer token expired; re-bootstrapping guest session")
+            self.auth.token = ""
+            self.auth.token_expires_at = None
+            self.auth.is_logged_in = False
+            self.auth.is_guest_mode = True
+
         parsed_base = urlparse(self.BASE_URL)
         if "host" not in params:
              params["host"] = parsed_base.netloc

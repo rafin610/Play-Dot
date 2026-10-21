@@ -38,12 +38,18 @@ reviewing a release.
    - `MOVIEBOX_USER_ID`
    - `MOVIEBOX_GATEWAY_SECRET` (base64 key material)
    - `MOVIEBOX_APPID`
-4. Treat the credentials currently in local `.env` as stale. The guest JWT
-   present during this audit had an expiry date of **2026-10-11**; sessions
-   worked only because the provider issued a refreshed token during bootstrap.
-   A fresh value is safer and is required if bootstrap no longer refreshes.
-5. Rotate any provider credentials that were ever committed. Redaction in the
-   current tree does not remove Git history.
+4. Guest JWTs last ~90 days. Rotate the local pair before deploying:
+   ```bash
+   .venv/bin/python scripts/refresh_guest_token.py
+   ```
+   The script performs the anonymous provider handshake, rewrites
+   `MOVIEBOX_GUEST_TOKEN` and its paired `MOVIEBOX_USER_ID` in `.env`, and
+   prints the new expiry. Paste both values into Render's Environment UI.
+   `/health` reports `guest_token.expires_at` and adds a warning during the
+   final 7 days; an expired seed remains recoverable because new sessions
+   bootstrap an anonymous token, but it should still be rotated.
+5. Treat any credential that ever reached Git history as compromised and rotate
+   it at the provider. Redaction in the current tree does not remove history.
 6. Never paste credentials into `render.yaml`, source files, tests, docs, chat,
    or an APK. Enter them only in Render's Environment UI (or via the Render
    dashboard/API using a secret manager).
@@ -113,8 +119,8 @@ Do not set `PORT` manually; Render supplies it. `HOST` defaults to `0.0.0.0`.
 
 | Variable | Required | Render value |
 |---|---|---|
-| `MOVIEBOX_GUEST_TOKEN` | Yes | Fresh provider guest JWT; secret, `sync: false`. |
-| `MOVIEBOX_USER_ID` | Yes | Provider user ID paired with the token; secret. |
+| `MOVIEBOX_GUEST_TOKEN` | Yes | Fresh provider guest JWT (~90-day lifetime); secret, `sync: false`. Rotate with `scripts/refresh_guest_token.py`. |
+| `MOVIEBOX_USER_ID` | Yes | Provider user ID paired with the token; update it whenever the token rotates. |
 | `MOVIEBOX_GATEWAY_SECRET` | Yes | Base64 gateway secret; secret, never logged. |
 | `MOVIEBOX_APPID` | Yes | Provider appid header value; secret. |
 | `PYTHON_VERSION` | Yes | `3.12.3` (also pinned by `.python-version`). |

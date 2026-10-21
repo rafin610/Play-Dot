@@ -19,6 +19,7 @@ import ipaddress
 import threading
 import time
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from urllib.parse import quote, urljoin, urlparse
 from dotenv import load_dotenv
 
@@ -27,7 +28,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from moviebox_api import MovieBoxClient, MovieBoxAuth, MovieBoxContent, MovieBoxStream, MovieBoxUser
-from moviebox_api.auth import default_guest_token
+from moviebox_api.auth import decode_jwt_expiry, default_guest_token
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -57,6 +58,46 @@ def configuration_errors() -> List[str]:
         except Exception:
             errors.append("MOVIEBOX_GATEWAY_SECRET is not valid base64")
     return errors
+
+
+# Warn before the seeded guest JWT actually lapses so a rotation is not a surprise.
+GUEST_TOKEN_WARNING_DAYS = 7
+
+
+def guest_token_status() -> dict:
+    """Expiry metadata for MOVIEBOX_GUEST_TOKEN. Never returns the token itself."""
+    token = os.getenv("MOVIEBOX_GUEST_TOKEN", "").strip()
+    expires_at = decode_jwt_expiry(token) if token else None
+    if expires_at is None:
+        return {}
+
+    remaining_seconds = expires_at - int(time.time())
+    return {
+        "expires_at": datetime.fromtimestamp(expires_at, timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z"),
+        "expires_in_days": round(remaining_seconds / 86400, 1),
+        "expired": remaining_seconds <= 0,
+    }
+
+
+def configuration_warnings() -> List[str]:
+    """Non-fatal configuration problems (expiring credentials), names only."""
+    status = guest_token_status()
+    if not status:
+        return []
+    if status["expired"]:
+        return [
+            f"MOVIEBOX_GUEST_TOKEN expired on {status['expires_at']}. Sessions still "
+            "bootstrap anonymous guest tokens, but rotate the seed with "
+            "`python scripts/refresh_guest_token.py`."
+        ]
+    if status["expires_in_days"] <= GUEST_TOKEN_WARNING_DAYS:
+        return [
+            f"MOVIEBOX_GUEST_TOKEN expires in {status['expires_in_days']} day(s) on "
+            f"{status['expires_at']}. Rotate it with `python scripts/refresh_guest_token.py`."
+        ]
+    return []
 
 
 def _safe_url_label(url: str) -> str:
@@ -126,6 +167,8 @@ async def lifespan(_app: FastAPI):
         logger.error("Backend configuration is incomplete: %s", "; ".join(errors))
     else:
         logger.info("Backend configuration validated.")
+    for warning in configuration_warnings():
+        logger.warning(warning)
     yield
 
 
@@ -142,17 +185,27 @@ def root_health():
 def health_check():
     """Readiness endpoint used by Render and deployment smoke tests."""
     errors = configuration_errors()
+    warnings = configuration_warnings()
     if errors:
-        return JSONResponse(
-            status_code=503,
-            content={
-                "status": "error",
-                "service": SERVICE_NAME,
-                "version": APP_VERSION,
-                "missing_env": errors,
-            },
-        )
-    return {"status": "ok", "service": SERVICE_NAME, "version": APP_VERSION}
+        content = {
+            "status": "error",
+            "service": SERVICE_NAME,
+            "version": APP_VERSION,
+            "missing_env": errors,
+        }
+        if warnings:
+            content["warnings"] = warnings
+        return JSONResponse(status_code=503, content=content)
+
+    payload = {
+        "status": "ok",
+        "service": SERVICE_NAME,
+        "version": APP_VERSION,
+        "guest_token": guest_token_status(),
+    }
+    if warnings:
+        payload["warnings"] = warnings
+    return payload
 
 # Enable CORS for local and deployed Wotchly frontends.
 # Render/Netlify deployments have historically used both variable names, so
