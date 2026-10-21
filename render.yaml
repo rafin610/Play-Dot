@@ -13,7 +13,7 @@ services:
     # Sessions live in process memory; keep exactly one instance.
     numInstances: 1
     branch: main
-    repo: https://github.com/solo12345689/moviebox-internal-api
+    repo: https://github.com/rafin610/Play-Dot
     buildCommand: pip install --upgrade pip && pip install -r requirements.txt
     startCommand: uvicorn moviebox_api_server:app --host 0.0.0.0 --port $PORT --proxy-headers
     healthCheckPath: /health
