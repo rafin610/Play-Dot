@@ -1,10 +1,9 @@
 # Render Deployment Guide
 
-Status as of **2026-10-21**: this repository contains a Render Blueprint and the
-backend is deployment-ready, but **no Render service was created and no public
-HTTPS URL exists**. Do not treat any value in this guide as an already-live
-endpoint. Deployment is an explicit owner action and was intentionally not
-performed during the audit.
+Status as of **2026-10-21**: this repository contains a Docker-based Render
+Blueprint and hardened backend configuration, but **no Render service was
+created and no public HTTPS URL exists**. Do not treat any value in this guide
+as an already-live endpoint. Deployment is an explicit owner action.
 
 The Android app must be rebuilt with the real HTTPS origin after the service is
 created. A release APK built with a local URL cannot be used as the production
@@ -14,7 +13,8 @@ artifact.
 
 | File | Purpose |
 |---|---|
-| `render.yaml` | Blueprint: free Python web service, `main` branch, one Uvicorn worker, `/health` check, manual deploys only. |
+| `render.yaml` | Blueprint: paid Docker web service with FFmpeg, `main` branch, one instance, `/health` check, manual deploys only. |
+| `Dockerfile` | Python 3.12 image with FFmpeg/ffprobe for media compatibility and HLS/DASH handling. |
 | `.python-version` | Pins Python `3.12.3`, the version used for the audit. |
 | `requirements.txt` | Exact tested versions of FastAPI, Uvicorn, Requests, Pydantic, HTTPX, and python-dotenv. |
 | `.env.example` | Names and descriptions of required/optional settings. Contains placeholders only. |
@@ -29,7 +29,7 @@ reviewing a release.
 ## 2. Preconditions
 
 1. The repository is pushed to
-   `https://github.com/solo12345689/moviebox-internal-api.git` on `main`.
+   `https://github.com/rafin610/Play-Dot.git` on `main`.
    `render.yaml` references that repository and branch.
 2. The Render account has access to the repository. For a private repository,
    grant Render's GitHub app access first.
@@ -82,8 +82,8 @@ it. `/` is liveness only and is not a readiness proof.
 2. Connect the GitHub repository and select the `main` branch.
 3. Review the service created from `render.yaml`:
    - type: Web Service
-   - runtime: Python
-   - plan: Free
+   - runtime: Docker
+   - plan: Starter (paid; confirm the current Render price in the dashboard)
    - branch: `main`
    - health check: `/health`
    - one worker
@@ -91,20 +91,18 @@ it. `/` is liveness only and is not a readiness proof.
    from step 2.
 5. Create/import the Blueprint. **This is the deployment approval step.** Do not
    import it until the owner approves deployment.
-6. If the service name `moviebox-internal-api` is already taken, choose another
+6. If the service name `play-dot-api` is already taken, choose another
    name. Use the actual assigned hostname everywhere below.
 
 ### Manual web-service alternative
 
-If Blueprint import is not used, create a Python Web Service with:
+If Blueprint import is not used, create a Docker Web Service with:
 
 | Setting | Value |
 |---|---|
-| Repository | `solo12345689/moviebox-internal-api` |
+| Repository | `rafin610/Play-Dot` |
 | Branch | `main` |
-| Runtime | Python 3.12.3 |
-| Build command | `pip install --upgrade pip && pip install -r requirements.txt` |
-| Start command | `uvicorn moviebox_api_server:app --host 0.0.0.0 --port $PORT --proxy-headers` |
+| Runtime | Docker (`./Dockerfile`) |
 | Health check path | `/health` |
 | Auto deploy | Off |
 | Instances/workers | 1 |
@@ -120,6 +118,7 @@ Do not set `PORT` manually; Render supplies it. `HOST` defaults to `0.0.0.0`.
 | `MOVIEBOX_GATEWAY_SECRET` | Yes | Base64 gateway secret; secret, never logged. |
 | `MOVIEBOX_APPID` | Yes | Provider appid header value; secret. |
 | `PYTHON_VERSION` | Yes | `3.12.3` (also pinned by `.python-version`). |
+| `COOKIE_SECURE` | Yes | `true` on HTTPS Render. |
 | `ENABLE_EXTERNAL_PLAYER` | No | `false` on Render. No desktop player exists there. |
 | `SESSION_TTL_SECONDS` | No | `1800` recommended; expires idle in-memory sessions. |
 | `MAX_SESSIONS` | No | `500` recommended; bounds memory. Keep one worker. |
@@ -232,16 +231,16 @@ repeat these checks against the HTTPS build.
 
 ## 8. Operational limitations
 
-- **Free plan**: the service can sleep after inactivity. The first request after
-  sleep is slow; Android timeouts may show a retry state.
+- **Paid starter plan**: one instance is recommended initially because sessions
+  are held in process memory. Add Redis/Postgres before horizontal scaling.
 - **One worker**: sessions are held in process memory. Do not raise the worker
   count without shared session storage, or requests will land on different
   session stores.
 - **Ephemeral disk**: `local_history.json` and any temporary files disappear on
   restart/redeploy. Android watchlist and resume progress use local DataStore and
   are unaffected.
-- **No FFmpeg**: `/download` for HLS/DASH returns `503` on Render because FFmpeg
-  is not installed. Native MP4 download may still work if the provider offers it.
+- **FFmpeg**: the Docker image includes FFmpeg/ffprobe; long transcodes still
+  consume CPU and should be tested with representative streams.
 - **External player disabled**: `/launch-player` returns `501` by configuration.
 - **Provider dependency**: upstream rate limits, expiring guest tokens, catalogue
   changes, and regional 404s remain outside this repository's control.

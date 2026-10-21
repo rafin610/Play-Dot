@@ -1,24 +1,17 @@
-# Render Blueprint for the MovieBox internal API.
-#
-# This file prepares the service but does not deploy it. Importing a Blueprint
-# is a separate, explicit action performed by the repository owner.
-#
-# Secrets are marked `sync: false`: Render prompts for them and stores them
-# outside Git. Never replace these with literal values in this file.
+# Render Blueprint for the Play-Dot FastAPI backend.
+# Secrets use sync:false and must be entered in Render's Environment UI.
 services:
   - type: web
-    name: moviebox-internal-api
-    runtime: python
-    plan: free
-    # Sessions live in process memory; keep exactly one instance.
-    numInstances: 1
+    name: play-dot-api
+    runtime: docker
+    plan: starter
     branch: main
     repo: https://github.com/rafin610/Play-Dot
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn moviebox_api_server:app --host 0.0.0.0 --port $PORT --proxy-headers
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
-    # Do not redeploy automatically until the owner explicitly approves a release.
     autoDeployTrigger: "off"
+    numInstances: 1
     envVars:
       - key: PYTHON_VERSION
         value: "3.12.3"
@@ -30,12 +23,14 @@ services:
         sync: false
       - key: MOVIEBOX_APPID
         sync: false
-      # A Render web service has no desktop player binary. Disable the local-only
-      # launch endpoint so it returns a clear 501 instead of failing unpredictably.
+      - key: COOKIE_SECURE
+        value: "true"
       - key: ENABLE_EXTERNAL_PLAYER
         value: "false"
-      # Sessions are in-process memory; keep one worker and bounded idle sessions.
       - key: SESSION_TTL_SECONDS
         value: "1800"
       - key: MAX_SESSIONS
         value: "500"
+      # Set this to the exact HTTPS dashboard origin when the dashboard is deployed.
+      - key: CORS_ORIGINS
+        sync: false

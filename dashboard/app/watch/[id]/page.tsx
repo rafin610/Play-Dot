@@ -2,7 +2,7 @@
 
 import React, { useEffect, useState, useRef } from 'react';
 import { useParams, useSearchParams, useRouter } from 'next/navigation';
-import { movieApi } from '@/lib/api';
+import { movieApi, API_BASE_URL } from '@/lib/api';
 import axios from 'axios';
 import { 
   ChevronLeft, Settings, Maximize, Volume2, 
@@ -132,7 +132,7 @@ export default function WatchPage() {
   const normalizeSubtitle = (sub: any) => {
     const rawUrl = sub.url || sub.subPath || '';
     // Proxy ALL subtitles to avoid taining the canvas during screenshots/thumbnails
-    const proxiedUrl = rawUrl ? `http://localhost:8000/sub-proxy?u=${encodeURIComponent(rawUrl)}` : '';
+    const proxiedUrl = rawUrl ? `${API_BASE_URL}/sub-proxy?u=${encodeURIComponent(rawUrl)}` : '';
     
     return {
         sid: sub.id || sub.sid || Math.random().toString(),
@@ -184,7 +184,7 @@ export default function WatchPage() {
     setIsTranscoding(true);
     setPlayerError(null);
     try {
-        const compatUrl = `http://localhost:8000/play-compat/${id}?season=${season}&episode=${episode}&quality=${selectedQuality}`;
+        const compatUrl = `${API_BASE_URL}/play-compat/${id}?season=${season}&episode=${episode}&quality=${selectedQuality}`;
         setStreamData({
             url: compatUrl,
             cookie: '', 
@@ -214,7 +214,7 @@ export default function WatchPage() {
 
   const downloadStream = () => {
      const movieTitle = encodeURIComponent(movie?.title || 'Movie');
-     const downloadUrl = `http://localhost:8000/download/${id}?season=${season}&episode=${episode}&quality=${selectedQuality}&title=${movieTitle}`;
+     const downloadUrl = `${API_BASE_URL}/download/${id}?season=${season}&episode=${episode}&quality=${selectedQuality}&title=${movieTitle}`;
      
      // PRO-LEVEL SILENT DOWNLOAD
      const link = document.createElement('a');
@@ -238,7 +238,7 @@ export default function WatchPage() {
             if (activeSub) subUrl = activeSub.subPath;
         }
 
-        await axios.post('http://localhost:8000/launch-player', null, {
+        await axios.post(`${API_BASE_URL}/launch-player`, null, {
             params: {
                 player: player,
                 url: streamData.url,

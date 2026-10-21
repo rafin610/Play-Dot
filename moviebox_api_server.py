@@ -323,6 +323,25 @@ class OtpRequest(BaseModel):
     authType: int = 1
     type: int = 1 # 1: Register, 2: Login
 
+
+def _public_user_payload(value) -> dict:
+    """Return only non-sensitive account fields to API clients."""
+    if not isinstance(value, dict):
+        return {}
+    blocked = {"token", "accessToken", "refreshToken", "sessionId", "session_id", "signCookie", "cookie"}
+    return {key: item for key, item in value.items() if key not in blocked}
+
+
+def _set_session_cookie(response: Response, session_id: str, *, max_age: Optional[int] = None):
+    response.set_cookie(
+        key="session_id",
+        value=session_id,
+        httponly=True,
+        secure=os.getenv("COOKIE_SECURE", "false").strip().lower() in ("1", "true", "yes", "on"),
+        samesite="lax",
+        max_age=max_age,
+    )
+
 @app.post("/request-otp")
 def request_otp(req: OtpRequest, session_id: Optional[str] = Cookie(None)):
     s = get_session(session_id)
@@ -339,14 +358,8 @@ def login(req: LoginRequest, response: Response, session_id: Optional[str] = Coo
         raise HTTPException(status_code=400, detail=res["message"])
     
     # Always set/refresh the session cookie on login
-    response.set_cookie(
-        key="session_id", 
-        value=s["id"], 
-        httponly=True, 
-        samesite="lax",
-        max_age=3600 * 24 * 30 # 30 days
-    )
-    return res
+    _set_session_cookie(response, s["id"], max_age=3600 * 24 * 30)
+    return {"status": "success", "user": _public_user_payload(res.get("user"))}
 
 @app.post("/register")
 def register(req: RegisterRequest, session_id: Optional[str] = Cookie(None)):
@@ -354,7 +367,7 @@ def register(req: RegisterRequest, session_id: Optional[str] = Cookie(None)):
     res = s["client"].register(req.account, req.password, req.otp, req.authType)
     if res["status"] == "error":
         raise HTTPException(status_code=400, detail=res["message"])
-    return res
+    return {"status": "success", "user": _public_user_payload(res.get("user"))}
 
 @app.post("/logout")
 def logout(response: Response, session_id: Optional[str] = Cookie(None)):
@@ -373,10 +386,10 @@ def get_user_info(response: Response, session_id: Optional[str] = Cookie(None)):
     
     # If no session_id was provided, set the newly created one
     if not session_id:
-        response.set_cookie(key="session_id", value=s["id"], httponly=True, samesite="lax")
+        _set_session_cookie(response, s["id"])
 
     if not s["auth"].is_logged_in:
-        return {"logged_in": False, "mode": "Guest Access", "session_id": s["id"]}
+        return {"logged_in": False, "mode": "Guest Access"}
 
     # Never echo the provider bearer token to clients.
     user_meta = dict(s["auth"].user_info or {})
@@ -384,8 +397,7 @@ def get_user_info(response: Response, session_id: Optional[str] = Cookie(None)):
     return {
         "logged_in": True,
         "mode": "Official Account", 
-        "user": user_meta,
-        "session_id": s["id"]
+        "user": _public_user_payload(user_meta)
     }
 
 def map_actor(actor: dict):
@@ -1352,8 +1364,8 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
             logger.error(f"Error extracting from resourceDetectors: {e}")
             
     # signCookie can be in root, in data, or in the session cookies
-    # FALLBACK: If all else fails, the signCookie is often just the user token
-    global_cookie = res.get("signCookie") or data.get("signCookie") or s["client"].session.cookies.get("signCookie") or s["auth"].token
+    # Never use the provider bearer token as a media cookie or return it to clients.
+    global_cookie = res.get("signCookie") or data.get("signCookie") or s["client"].session.cookies.get("signCookie")
     logger.info(f"Phase 1 - Primary Result: {len(streams)} streams found (code: {res.get('code')}) (Cookie: {'YES' if global_cookie else 'NO'})")
     import requests
     
