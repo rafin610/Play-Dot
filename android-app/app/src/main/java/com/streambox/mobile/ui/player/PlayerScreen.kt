@@ -48,7 +48,6 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
-import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -74,6 +73,7 @@ import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.ui.PlayerView
+import com.streambox.mobile.R
 import com.streambox.mobile.ui.components.ErrorState
 import com.streambox.mobile.ui.theme.AppBackground
 import com.streambox.mobile.ui.theme.AppBrandAction
@@ -173,10 +173,8 @@ fun PlayerScreen(
             // --- video surface ---
             AndroidView(
                 factory = { ctx ->
-                    PlayerView(ctx).apply {
-                        useController = false
-                        keepScreenOn = true
-                    }
+                    android.view.LayoutInflater.from(ctx)
+                        .inflate(R.layout.player_view, null, false) as PlayerView
                 },
                 update = { view -> view.player = viewModel.player },
                 onRelease = { view -> view.player = null },
@@ -215,6 +213,25 @@ fun PlayerScreen(
                         }
                     },
                     onCancelClick = { viewModel.cancelAutoNext() },
+                )
+            }
+
+            if (state.status in setOf(PlayerStatus.PLAYING, PlayerStatus.PAUSED) &&
+                !state.firstVideoFrameRendered
+            ) {
+                val message = when {
+                    !state.videoTrackPresent -> "This source has no video track."
+                    !state.supportedVideoTrackPresent -> "This device does not support the source's video format."
+                    else -> "No video frame has rendered. The source or device decoder may not provide video."
+                }
+                Text(
+                    text = message,
+                    color = Color.White,
+                    style = MaterialTheme.typography.bodySmall,
+                    modifier = Modifier
+                        .align(Alignment.Center)
+                        .background(Color.Black.copy(alpha = 0.72f), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
                 )
             }
 
@@ -374,6 +391,7 @@ private fun ControlsOverlay(
 ) {
     val activity = LocalContext.current.findActivity()
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showSubtitleDialog by remember { mutableStateOf(false) }
     var interactionTick by remember { mutableStateOf(0) }
     LaunchedEffect(state.controlsVisible, state.status, interactionTick) {
         if (state.controlsVisible && state.status == PlayerStatus.PLAYING) {
@@ -413,12 +431,12 @@ private fun ControlsOverlay(
                     )
                 }
             }
-            IconButton(onClick = { showSettingsDialog = true }, modifier = Modifier.size(36.dp)) {
+            IconButton(onClick = { showSubtitleDialog = true }, modifier = Modifier.size(44.dp)) {
                 Text("CC", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold, color = Color.White)
             }
             IconButton(
                 onClick = { showSettingsDialog = true },
-                modifier = Modifier.size(36.dp),
+                modifier = Modifier.size(44.dp),
             ) {
                 Icon(
                     imageVector = Icons.Filled.Settings,
@@ -428,7 +446,7 @@ private fun ControlsOverlay(
             }
             IconButton(
                 onClick = { activity?.let(onToggleFullscreen) },
-                modifier = Modifier.size(36.dp),
+                modifier = Modifier.size(44.dp),
             ) {
                 Icon(
                     imageVector = if (isFullscreen) Icons.Filled.CloseFullscreen else Icons.Filled.Fullscreen,
@@ -537,6 +555,13 @@ private fun ControlsOverlay(
             onDismiss = { showSettingsDialog = false },
         )
     }
+    if (showSubtitleDialog) {
+        SubtitleSelectionDialog(
+            state = state,
+            vm = vm,
+            onDismiss = { showSubtitleDialog = false },
+        )
+    }
 }
 
 /** Buffered-range seek slider with drag preview. */
@@ -631,8 +656,6 @@ private fun PlaybackSettingsDialog(state: PlayerUiState, vm: PlayerViewModel, on
     val video = state.tracks.filter { it.type == "video" }
     val audio = state.tracks.filter { it.type == "audio" }
     val text = state.tracks.filter { it.type == "text" }
-    var subsOn by remember { mutableStateOf(vm.subtitlesAvailable() && vm.subtitlesEnabled()) }
-    var speed by remember { mutableStateOf(state.playbackSpeed) }
 
     AlertDialog(
         containerColor = AppSurface,
@@ -643,23 +666,45 @@ private fun PlaybackSettingsDialog(state: PlayerUiState, vm: PlayerViewModel, on
                 Modifier.verticalScroll(rememberScrollState()),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                if (video.isNotEmpty()) TrackGroup("Video quality", video, vm)
-                if (audio.isNotEmpty()) TrackGroup("Audio language", audio, vm)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("Subtitles", style = MaterialTheme.typography.titleMedium, color = Color.White)
-                    Spacer(Modifier.weight(1f))
-                    Switch(checked = subsOn, onCheckedChange = { checked ->
-                        subsOn = checked
-                        vm.toggleSubtitles()
-                    })
-                }
-                if (text.isNotEmpty()) {
+                if (state.qualitySelectionAvailable) {
+                    TrackGroup(
+                        title = "Video quality",
+                        options = video,
+                        vm = vm,
+                        automaticSelected = state.automaticVideo,
+                        onAutomaticSelected = { vm.selectAutomaticTrack("video") },
+                    )
+                } else {
                     Text(
-                        text = text.joinToString(" · ") { it.label },
-                        style = MaterialTheme.typography.labelSmall,
+                        text = when {
+                            video.isEmpty() -> "No video quality information is available for this source."
+                            else -> "Only ${video.single().label} is available; quality selection is unavailable."
+                        },
+                        style = MaterialTheme.typography.bodyMedium,
                         color = AppTextSecondary,
                     )
                 }
+                if (audio.isNotEmpty()) {
+                    TrackGroup(
+                        title = "Audio language",
+                        options = audio,
+                        vm = vm,
+                        automaticSelected = state.automaticAudio,
+                        onAutomaticSelected = { vm.selectAutomaticTrack("audio") },
+                    )
+                } else {
+                    Text(
+                        text = "No selectable audio tracks are available.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = AppTextSecondary,
+                    )
+                }
+                SubtitleTrackGroup(
+                    options = text,
+                    selectedTrack = state.subtitleTrackSelected,
+                    onOff = vm::disableSubtitles,
+                    onSelect = vm::selectTrack,
+                )
                 Spacer(Modifier.height(8.dp))
                 Text(
                     text = "Playback speed",
@@ -668,13 +713,12 @@ private fun PlaybackSettingsDialog(state: PlayerUiState, vm: PlayerViewModel, on
                 )
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     listOf(0.5f, 1.0f, 1.5f, 2.0f).forEach { sp ->
-                        val isSelected = speed == sp
+                        val isSelected = state.playbackSpeed == sp
                         Button(
                             onClick = {
-                                speed = sp
                                 vm.setPlaybackSpeed(sp)
                             },
-                            enabled = sp != state.playbackSpeed,
+                            enabled = !isSelected,
                             colors = ButtonDefaults.buttonColors(
                                 containerColor = if (isSelected) AppBrandAction else Color.Black.copy(alpha = 0.3f),
                                 contentColor = Color.White,
@@ -683,14 +727,6 @@ private fun PlaybackSettingsDialog(state: PlayerUiState, vm: PlayerViewModel, on
                             Text("${sp}x", style = MaterialTheme.typography.labelMedium)
                         }
                     }
-                }
-                if (video.isEmpty() && audio.isEmpty() && text.isEmpty()) {
-                    Text(
-                        text = "This stream reports no selectable tracks.",
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = AppTextSecondary,
-                        modifier = Modifier.padding(bottom = 6.dp),
-                    )
                 }
             }
         },
@@ -701,33 +737,104 @@ private fun PlaybackSettingsDialog(state: PlayerUiState, vm: PlayerViewModel, on
 }
 
 @Composable
-private fun TrackGroup(title: String, options: List<TrackOption>, vm: PlayerViewModel) {
+private fun SubtitleSelectionDialog(
+    state: PlayerUiState,
+    vm: PlayerViewModel,
+    onDismiss: () -> Unit,
+) {
+    val subtitles = state.tracks.filter { it.type == "text" }
+    AlertDialog(
+        containerColor = AppSurface,
+        onDismissRequest = onDismiss,
+        title = { Text("Subtitles", color = Color.White) },
+        text = {
+            Column(
+                Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
+                SubtitleTrackGroup(
+                    options = subtitles,
+                    selectedTrack = state.subtitleTrackSelected,
+                    onOff = vm::disableSubtitles,
+                    onSelect = vm::selectTrack,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Done") }
+        },
+    )
+}
+
+@Composable
+private fun TrackGroup(
+    title: String,
+    options: List<TrackOption>,
+    vm: PlayerViewModel,
+    automaticSelected: Boolean,
+    onAutomaticSelected: () -> Unit,
+) {
     Column {
         Text(
             text = title,
             style = MaterialTheme.typography.titleMedium,
             color = Color.White,
         )
-        options.take(12).forEach { option ->
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clickable { vm.selectTrack(option) }
-                    .padding(vertical = 6.dp),
-            ) {
-                Text(
-                    text = option.label,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = if (option.selected) MaterialTheme.colorScheme.primary else Color.White,
-                    modifier = Modifier.weight(1f),
-                )
-                if (option.selected) {
-                    Icon(Icons.Filled.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)
-                }
-            }
+        TrackOptionRow("Auto / default", automaticSelected, onAutomaticSelected)
+        options.forEach { option ->
+            TrackOptionRow(option.label, option.selected, onClick = { vm.selectTrack(option) })
         }
         Spacer(Modifier.height(4.dp))
+    }
+}
+
+@Composable
+private fun SubtitleTrackGroup(
+    options: List<TrackOption>,
+    selectedTrack: Boolean,
+    onOff: () -> Unit,
+    onSelect: (TrackOption) -> Unit,
+) {
+    Column {
+        Text(
+            text = "Subtitles",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color.White,
+        )
+        TrackOptionRow("Off", !selectedTrack, onOff)
+        if (options.isEmpty()) {
+            Text(
+                text = "No subtitle tracks are available for this source.",
+                style = MaterialTheme.typography.bodySmall,
+                color = AppTextSecondary,
+                modifier = Modifier.padding(vertical = 4.dp),
+            )
+        } else {
+            options.forEach { option ->
+                TrackOptionRow(option.label, option.selected) { onSelect(option) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TrackOptionRow(label: String, selected: Boolean, onClick: () -> Unit) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick)
+            .padding(vertical = 8.dp),
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyMedium,
+            color = if (selected) MaterialTheme.colorScheme.primary else Color.White,
+            modifier = Modifier.weight(1f),
+        )
+        if (selected) {
+            Icon(Icons.Filled.Check, contentDescription = "Selected", tint = MaterialTheme.colorScheme.primary)
+        }
     }
 }
 

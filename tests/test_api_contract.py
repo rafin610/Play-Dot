@@ -305,6 +305,56 @@ class ApiContractTest(unittest.TestCase):
         # TLS verification must not be disabled for the probe.
         self.assertTrue(all(call.kwargs.get("verify") is not False for call in head.call_args_list))
 
+    def test_stream_prefers_metadata_confirmed_h264_over_hevc(self):
+        class HeadResponse:
+            status_code = 200
+
+        h264_url = "https://cdn.example.test/video/opaque-a.mp4"
+        play_info = {
+            "code": 0,
+            "data": {
+                "streamList": [
+                    {
+                        "url": "https://cdn.example.test/video/opaque-b.mp4",
+                        "quality": "1080p",
+                        "codecName": "H.265",
+                    },
+                    {"url": h264_url, "quality": "720p", "codecName": "AVC1"},
+                ],
+                "subTitleList": [],
+            },
+        }
+        with (
+            patch.object(self.session["stream"], "get_play_info", return_value=play_info),
+            patch("requests.head", return_value=HeadResponse()),
+        ):
+            response = self.client.get("/stream/1234567890123456789")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(h264_url, response.json()["url"])
+
+    def test_stream_does_not_select_candidate_after_access_probes_fail(self):
+        class HeadResponse:
+            status_code = 403
+
+        play_info = {
+            "code": 0,
+            "data": {
+                "streamList": [
+                    {"url": "https://cdn.example.test/video/opaque.mp4", "quality": "720p"},
+                ],
+                "subTitleList": [],
+            },
+        }
+        with (
+            patch.object(self.session["stream"], "get_play_info", return_value=play_info),
+            patch("requests.head", return_value=HeadResponse()),
+        ):
+            response = self.client.get("/stream/1234567890123456789")
+
+        self.assertEqual(404, response.status_code)
+        self.assertEqual("No streams found for this title.", response.json()["detail"])
+
     def test_stream_provider_rate_limit_is_clear(self):
         with patch.object(
             self.session["stream"],

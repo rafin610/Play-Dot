@@ -196,8 +196,10 @@ APK. Do not distribute it. Generate/restore the release keystore separately.
 
 ### Build with the HTTPS base URL
 
-The Gradle property must include the trailing slash and must use the real
-hostname:
+The Gradle property must use the real public hostname (a trailing slash is
+normalized automatically). `assembleRelease` fails when the property is missing,
+when it is not HTTPS, or when it targets a loopback/emulator host — this prevents
+an emulator-only APK from being installed on a phone:
 
 ```bash
 export JAVA_HOME=/path/to/jdk-17
@@ -206,7 +208,14 @@ export PATH="$JAVA_HOME/bin:$PATH"
 cd android-app
 ./gradlew :app:testDebugUnitTest :app:lintDebug
 ./gradlew :app:assembleRelease \
-  -Pstreambox.baseUrl=https://<service-name>.onrender.com/
+  -Pstreambox.baseUrl=https://play-dot.onrender.com/
+```
+
+The verified deployment for this repository is `https://play-dot.onrender.com/`.
+Confirm the live origin before building if the Render service was renamed:
+
+```bash
+curl -sS https://<service-name>.onrender.com/health
 ```
 
 Output:

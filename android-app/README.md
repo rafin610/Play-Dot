@@ -14,6 +14,13 @@ Display name: **PLAY DOT**. Package ID: `com.streambox.mobile` (kept stable for 
 | Watchlist | Local DataStore only |
 | Player | `GET /stream/{id}` via Media3/ExoPlayer, local resume progress |
 
+The player keeps one ViewModel-owned Media3 instance across Compose recompositions
+and uses a TextureView-backed `PlayerView` for reliable composition with Compose
+controls. Settings are built from supported Media3 tracks: adaptive video tracks
+can be selected manually or returned to Auto, audio tracks use actual language
+metadata, and CC lists embedded or backend-provided subtitles with an Off option.
+Fixed-quality sources do not expose invented quality choices.
+
 ## Build
 
 Requirements: JDK 17, Android SDK 35 (`local.properties`), Gradle wrapper 8.10.2.
@@ -21,28 +28,43 @@ Requirements: JDK 17, Android SDK 35 (`local.properties`), Gradle wrapper 8.10.2
 ```bash
 cd android-app
 
+# Debug APK, emulator backend (default http://10.0.2.2:8000/)
+./gradlew :app:assembleDebug
+
 # Debug APK using adb reverse for a physical device (no LAN IP in the app)
 adb reverse tcp:8000 tcp:8000
 ./gradlew :app:assembleDebug -Pstreambox.baseUrl=http://127.0.0.1:8000/
 
-# Signed verification release against a local emulator backend
-./gradlew :app:assembleRelease -Pstreambox.baseUrl=http://10.0.2.2:8101/
+# Production release: explicit public HTTPS origin (verified deployment shown)
+./gradlew :app:assembleRelease -Pstreambox.baseUrl=https://play-dot.onrender.com/
 
-# Production release: use the real Render HTTPS origin and keep the trailing /
-./gradlew :app:assembleRelease -Pstreambox.baseUrl=https://<service-name>.onrender.com/
+# CI equivalent
+STREAM_BOX_BASE_URL=https://play-dot.onrender.com/ ./gradlew :app:assembleRelease
 
 # Verification
 ./gradlew :app:testDebugUnitTest :app:lintDebug
+
+# Emulator playback verification (requires device internet access)
+./gradlew :app:connectedDebugAndroidTest
 ```
+
+The connected playback test uses Mux's public H.264/AAC HLS sample to verify a
+Media3 first-frame callback on the TextureView-backed `PlayerView`, real video
+quality/audio track groups, manual track overrides, pause, seek, and resume. This
+isolates Android rendering from MovieBox provider availability; it does not
+certify that a provider title has a compatible or currently accessible stream.
 
 Outputs:
 
 - `app/build/outputs/apk/debug/app-debug.apk`
 - `app/build/outputs/apk/release/app-release.apk`
 
-The backend default for emulator builds is `http://10.0.2.2:8000/`. Without
-`-Pstreambox.baseUrl`, that is baked in. Builds are not configured to reach a
-production server automatically.
+Debug builds default to the emulator host `http://10.0.2.2:8000/`, which only
+exists inside an emulator. `assembleRelease` **requires** an explicit public
+origin (`-Pstreambox.baseUrl` or `STREAM_BOX_BASE_URL`), rejects non-HTTPS URLs,
+and rejects loopback/emulator hosts via the `checkReleaseBaseUrl` task. A missing
+or mistyped property therefore fails the build instead of shipping an APK that
+cannot reach the backend. Trailing slashes are normalized automatically.
 
 ## Signing
 

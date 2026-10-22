@@ -1,3 +1,4 @@
+import java.net.URI
 import java.util.Properties
 
 plugins {
@@ -17,6 +18,19 @@ val keystoreProperties = Properties().apply {
     }
 }
 
+// Explicit backend origin for this build. The Gradle property wins over the
+// environment variable so CI and local builds can share one configuration.
+val streamboxBaseUrl: String? = providers.gradleProperty("streambox.baseUrl").orNull
+    ?: providers.environmentVariable("STREAM_BOX_BASE_URL").orNull
+
+// Retrofit requires a trailing slash; normalize here so a build never fails at
+// runtime just because the property was passed without one.
+val resolvedBaseUrl: String = streamboxBaseUrl
+    ?.trim()
+    ?.takeIf { it.isNotEmpty() }
+    ?.let { if (it.endsWith("/")) it else "$it/" }
+    ?: "http://10.0.2.2:8000/"
+
 android {
     namespace = "com.streambox.mobile"
     compileSdk = 35
@@ -27,6 +41,7 @@ android {
         targetSdk = 35
         versionCode = 2
         versionName = "1.0.0-playdot"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         vectorDrawables {
             useSupportLibrary = true
@@ -34,10 +49,12 @@ android {
 
         // Backend base URL, overridable per build without code changes:
         //   ./gradlew assembleDebug -Pstreambox.baseUrl=http://<LAN-IP>:8000/
-        // Default targets an emulator on the machine hosting the backend (10.0.2.2).
-        val streamboxBaseUrl = providers.gradleProperty("streambox.baseUrl").orNull
-            ?: "http://10.0.2.2:8000/"
-        buildConfigField("String", "STREAM_BASE_URL", "\"$streamboxBaseUrl\"")
+        //   ./gradlew assembleRelease -Pstreambox.baseUrl=https://<service>.onrender.com/
+        // Debug defaults to the emulator's host loopback (10.0.2.2). Release
+        // builds must pass an explicit public HTTPS origin; checkReleaseBaseUrl
+        // below rejects emulator/loopback targets so they cannot be shipped.
+        val baseUrl = resolvedBaseUrl
+        buildConfigField("String", "STREAM_BASE_URL", "\"$baseUrl\"")
     }
 
     signingConfigs {
@@ -128,4 +145,45 @@ dependencies {
     // Unit tests (Phase 3: DTO parsing + resume policy)
     testImplementation(libs.junit4)
     testImplementation(kotlin("test"))
+
+    // Device-level playback verification against a public H.264/AAC test stream.
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.junit4)
 }
+
+/**
+ * Release APKs must target a publicly reachable HTTPS backend. Without this
+ * guard the shared emulator default (`10.0.2.2`) silently ships and every
+ * request fails on a physical phone because that host only exists inside an
+ * emulator.
+ */
+val checkReleaseBaseUrl = tasks.register("checkReleaseBaseUrl") {
+    group = "verification"
+    description = "Rejects release builds that target an emulator or loopback backend."
+
+    doLast {
+        if (streamboxBaseUrl.isNullOrBlank()) {
+            throw GradleException(
+                "Release builds require -Pstreambox.baseUrl=https://<service>.onrender.com/ " +
+                    "(or the STREAM_BOX_BASE_URL environment variable).",
+            )
+        }
+        val uri = runCatching { URI(resolvedBaseUrl) }.getOrNull()
+            ?: throw GradleException("streambox.baseUrl is not a valid URL: $resolvedBaseUrl")
+        if (!uri.scheme.equals("https", ignoreCase = true)) {
+            throw GradleException("Release builds require an HTTPS backend URL, got: $resolvedBaseUrl")
+        }
+        val host = uri.host?.lowercase()
+            ?: throw GradleException("streambox.baseUrl has no host: $resolvedBaseUrl")
+        val localHost = host == "localhost" || host == "127.0.0.1" || host == "0.0.0.0" ||
+            host == "10.0.2.2" || host.endsWith(".local")
+        if (localHost) {
+            throw GradleException("Refusing to build a release APK against a local backend: $resolvedBaseUrl")
+        }
+    }
+}
+
+tasks.matching { it.name in setOf("assembleRelease", "bundleRelease", "packageRelease") }
+    .configureEach { dependsOn(checkReleaseBaseUrl) }

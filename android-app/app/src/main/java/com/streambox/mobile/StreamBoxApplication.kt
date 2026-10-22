@@ -4,6 +4,7 @@ import android.app.Application
 import android.content.Context
 import android.os.Process
 import android.util.Log
+import com.streambox.mobile.data.ApiConfig
 import com.streambox.mobile.data.local.ProgressStore
 import com.streambox.mobile.data.local.WatchlistStore
 import com.streambox.mobile.data.remote.ApiClient
@@ -12,6 +13,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+
+private const val TAG = "PlayDot"
 
 /** Minimal manual DI container (no extra framework, Phase 2 scope). */
 class AppContainer(context: Context) {
@@ -29,6 +32,12 @@ class StreamBoxApplication : Application() {
         super.onCreate()
         installCrashLogger()
         container = AppContainer(this)
+        // Diagnostic only (never a secret): makes a wrong build-time backend
+        // origin obvious in logcat during release verification.
+        Log.i(TAG, "Backend base URL: ${ApiConfig.BASE_URL} (debug=${BuildConfig.DEBUG})")
+        if (!ApiConfig.BASE_URL.startsWith("https://")) {
+            Log.w(TAG, "Backend URL is not HTTPS; production devices may reject or fail to reach it.")
+        }
     }
 
     /**

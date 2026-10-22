@@ -1429,24 +1429,34 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
     # Normalize quality for official API (expects lowercase)
     official_quality = quality.lower() if quality else "720p"
     
-    # Try current stream list first (Strict Codec Enforcement)
-    # Browsers generally FAIL to play H.265 (HEVC) or complex HEV1 DASH manifests.
-    # We strictly prioritize H.264 (AVC) MP4 > HLS > (Anything else).
-    
+    # Codec is taken from provider metadata only; opaque URLs and .mp4 suffixes
+    # do not identify the encoded video format.
+    def stream_codec(st):
+        for key in ("codec", "codecName", "videoCodec", "videoCodecName"):
+            value = st.get(key)
+            if not value:
+                continue
+            normalized = re.sub(r"[^a-z0-9]", "", str(value).lower())
+            if any(marker in normalized for marker in ("hevc", "h265", "hev1", "hvc1")):
+                return "hevc"
+            if any(marker in normalized for marker in ("h264", "avc", "avc1")):
+                return "h264"
+        return "unknown"
+
     def prioritize_h264(st):
-        u = st.get("url", "").lower()
-        if "h265" in u or "x265" in u or "hev1" in u: return 10 # Very low priority
-        if ".mp4" in u: return 0  # Highest priority
-        if ".m3u8" in u: return 1 # Good priority
-        return 5 # DASH is risky but better than H265
-    
+        url = st.get("url", "").lower()
+        format_priority = 0 if ".mp4" in url else 1 if ".m3u8" in url else 2
+        codec_priority = {"h264": 0, "unknown": 1, "hevc": 2}[stream_codec(st)]
+        return codec_priority, format_priority
+
     prioritized_streams = sorted(streams, key=prioritize_h264)
 
-    # Pass 1: Try to find a playable non-HEVC stream
+    # First use accessible AVC candidates, then candidates whose codec is not
+    # declared. Confirmed HEVC candidates are a fallback, not a URL-name guess.
     for st in prioritized_streams:
         url = st.get("url")
         if not url: continue
-        if any(bad in url.lower() for bad in ["h265", "x265", "hev1"]):
+        if stream_codec(st) == "hevc":
             continue
         cookie = st.get("signCookie") or global_cookie or ""
         try:
@@ -1462,9 +1472,11 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
                 break
         except: continue
 
-    # Pass 2: Fallback to playable HEVC stream if no non-HEVC stream is available
+    # HEVC remains playable on devices with a compatible decoder.
     if not working_stream:
         for st in prioritized_streams:
+            if stream_codec(st) != "hevc":
+                continue
             url = st.get("url")
             if not url: continue
             cookie = st.get("signCookie") or global_cookie or ""
@@ -1578,18 +1590,6 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
         except Exception as e:
             logger.warning(f"Resource Mirror Lookup Failed: {e}")
 
-    # PROACTIVE AUTO-FAILOVER: Scan for HEVC/H.265 and trigger transcode 
-    # Browser standard support is H.264 (AVC) and VP9/AV1.
-    is_hevc = any("h265" in st.get("url", "").lower() or "x265" in st.get("url", "").lower() or "hev1" in st.get("url", "").lower() or "h.265" in st.get("url", "").lower() for st in streams)
-    
-    # We also check for 'hev1' codec signatures in manifest URLs if found
-    h265_candidate = next((st for st in streams if any(bad in st.get("url", "").lower() for bad in ["h265", "x265", "hev1", "h.265"])), None)
-    
-    if is_hevc and h265_candidate:
-        logger.info(f"Detected HEVC/H.265. Directly serving RAW stream for Native Player support...")
-        working_stream = h265_candidate
-        working_cookie = working_stream.get("signCookie") or global_cookie or ""
-
     # SECONDARY FALLBACK: API Cluster Rotation
     if not working_stream:
         logger.info(f"Entering Phase 4 Cluster Rotation for {subject_id}")
@@ -1664,10 +1664,6 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
             finally:
                 s["client"].BASE_URL = orig_base
     
-    if not working_stream and streams:
-        working_stream = streams[0]
-        working_cookie = working_stream.get("signCookie") or global_cookie or ""
-
     if not working_stream:
         logger.error(
             "RESOLUTION FAILURE: No usable streams found for subject %s (provider code=%s)",

@@ -2,6 +2,7 @@ package com.streambox.mobile.ui.player
 
 import android.content.Context
 import android.util.Log
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import androidx.media3.common.C
@@ -11,7 +12,6 @@ import androidx.media3.common.MimeTypes
 import androidx.media3.common.Player
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.TrackSelectionOverride
-import androidx.media3.common.TrackSelectionParameters
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -54,7 +54,6 @@ enum class PlayerStatus { RESOLVING, PREPARING, BUFFERING, PLAYING, PAUSED, ERRO
 data class TrackOption(
     val type: String, // "video" | "audio" | "text"
     val label: String,
-    val trackUid: String,
     val selected: Boolean,
     val override: TrackSelectionOverride?,
 )
@@ -76,6 +75,13 @@ data class PlayerUiState(
     val errorRetryable: Boolean = false,
     val errorDetail: String = "",
     val tracks: List<TrackOption> = emptyList(),
+    val automaticVideo: Boolean = true,
+    val automaticAudio: Boolean = true,
+    val subtitleTrackSelected: Boolean = false,
+    val qualitySelectionAvailable: Boolean = false,
+    val videoTrackPresent: Boolean = false,
+    val supportedVideoTrackPresent: Boolean = false,
+    val firstVideoFrameRendered: Boolean = false,
     val prevEpisode: Int? = null,
     val nextEpisode: Int? = null,
     val resumeAppliedMs: Long = 0,
@@ -105,17 +111,47 @@ class PlayerViewModel(
     private var tickJob: Job? = null
     private var autoNextJob: Job? = null
     private var resolveJob: Job? = null
+    private var firstFrameTimeoutJob: Job? = null
+    private var firstFrameTimeoutStartedAtMs: Long? = null
+    private var firstFrameTimeoutRemainingMs = FIRST_VIDEO_FRAME_TIMEOUT_MS
 
     private val listener = object : Player.Listener {
         override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
             publishPlayerSnapshot()
+            if (playWhenReady) startFirstFrameTimeout() else pauseFirstFrameTimeout()
         }
 
         override fun onPlaybackStateChanged(playbackState: Int) {
             publishPlayerSnapshot()
+            if (playbackState == Player.STATE_READY) {
+                startFirstFrameTimeout()
+            } else {
+                pauseFirstFrameTimeout()
+            }
             if (playbackState == Player.STATE_ENDED && _state.value.isSeries) {
                 scheduleAutoNext()
             }
+        }
+
+        override fun onTracksChanged(tracks: androidx.media3.common.Tracks) {
+            val groups = tracks.groups
+            Log.i(
+                TAG,
+                "Track groups: video=${groups.count { it.type == C.TRACK_TYPE_VIDEO }} " +
+                    "audio=${groups.count { it.type == C.TRACK_TYPE_AUDIO }} " +
+                    "text=${groups.count { it.type == C.TRACK_TYPE_TEXT }}",
+            )
+            publishPlayerSnapshot()
+        }
+
+        override fun onRenderedFirstFrame() {
+            Log.i(TAG, "First video frame rendered")
+            resetFirstFrameTimeout()
+            _state.value = _state.value.copy(firstVideoFrameRendered = true)
+        }
+
+        override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+            Log.i(TAG, "Video size: ${videoSize.width}x${videoSize.height}")
         }
 
         override fun onPlaybackParametersChanged(playbackParameters: androidx.media3.common.PlaybackParameters) {
@@ -123,6 +159,7 @@ class PlayerViewModel(
         }
 
         override fun onPlayerError(error: PlaybackException) {
+            resetFirstFrameTimeout()
             Log.e(TAG, "Playback error: code=${error.errorCode} msg=${error.message}", error)
             _state.value = _state.value.copy(
                 status = PlayerStatus.ERROR,
@@ -145,6 +182,7 @@ class PlayerViewModel(
         resourceId: String? = null,
     ) {
         cancelAutoNext()
+        resetFirstFrameTimeout()
         // Only one resolve may be in flight. Without this, quickly switching
         // episodes can let an older request finish last and attach the wrong
         // stream (or leak a second player).
@@ -231,10 +269,12 @@ class PlayerViewModel(
         posterUrl: String?,
     ) {
         _state.value = _state.value.copy(status = PlayerStatus.PREPARING)
+        resetFirstFrameTimeout()
 
         val mime = when {
             stream.isHls || stream.url.substringBefore('?').endsWith(".m3u8") -> MimeTypes.APPLICATION_M3U8
             stream.url.substringBefore('?').endsWith(".mpd") -> MimeTypes.APPLICATION_MPD
+            stream.url.substringBefore('?').endsWith(".mp4") -> MimeTypes.VIDEO_MP4
             else -> null
         }
 
@@ -248,13 +288,27 @@ class PlayerViewModel(
             }
         }
 
-        val configs = stream.subtitles.mapNotNull { st ->
-            val url = st.url ?: return@mapNotNull null
-            MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(url))
-                .setMimeType(mimeForSubtitle(url))
-                .setLanguage(st.lan ?: st.lanName ?: "und")
-                .setLabel(st.lanName ?: st.lan ?: "Subtitles")
-                .build()
+        val subtitleUrls = stream.subtitles.mapNotNull { it.url }.toSet()
+        val configs = buildList {
+            stream.subtitles.forEach { st ->
+                val url = st.url ?: return@forEach
+                add(
+                    MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(url))
+                        .setMimeType(mimeForSubtitle(url))
+                        .setLanguage(st.lan ?: st.lanName ?: "und")
+                        .setLabel(st.lanName ?: st.lan ?: "Subtitles")
+                        .build(),
+                )
+            }
+            stream.subtitleUrl?.takeIf { it !in subtitleUrls }?.let { url ->
+                add(
+                    MediaItem.SubtitleConfiguration.Builder(android.net.Uri.parse(url))
+                        .setMimeType(mimeForSubtitle(url))
+                        .setLanguage("en")
+                        .setLabel("English")
+                        .build(),
+                )
+            }
         }
 
         val metaBuilder = MediaMetadata.Builder().setTitle(_state.value.title)
@@ -399,7 +453,10 @@ class PlayerViewModel(
 
     private fun publishPlayerSnapshot() {
         val p = player ?: return
+        val tracks = snapshotTracks()
+        val currentStatus = _state.value.status
         val status = when {
+            currentStatus == PlayerStatus.ERROR || currentStatus == PlayerStatus.UNAVAILABLE -> currentStatus
             p.playbackState == Player.STATE_IDLE && p.playerError != null -> PlayerStatus.ERROR
             p.playbackState == Player.STATE_IDLE -> PlayerStatus.PAUSED
             p.playbackState == Player.STATE_BUFFERING -> PlayerStatus.BUFFERING
@@ -412,8 +469,99 @@ class PlayerViewModel(
             positionMs = p.currentPosition.coerceAtLeast(0),
             durationMs = if (p.duration > 0) p.duration else _state.value.durationMs,
             bufferedMs = p.bufferedPosition.coerceAtLeast(0),
-            tracks = snapshotTracks(),
+            tracks = tracks,
+            automaticVideo = isTrackTypeAutomatic(p, androidx.media3.common.C.TRACK_TYPE_VIDEO),
+            automaticAudio = isTrackTypeAutomatic(p, androidx.media3.common.C.TRACK_TYPE_AUDIO),
+            subtitleTrackSelected = p.currentTracks.groups.any { group ->
+                group.type == androidx.media3.common.C.TRACK_TYPE_TEXT &&
+                    (0 until group.length).any(group::isTrackSelected)
+            },
+            qualitySelectionAvailable = tracks.count { it.type == "video" } > 1,
+            videoTrackPresent = p.currentTracks.groups.any {
+                it.type == androidx.media3.common.C.TRACK_TYPE_VIDEO
+            },
+            supportedVideoTrackPresent = tracks.any { it.type == "video" },
         )
+    }
+
+    private fun startFirstFrameTimeout() {
+        val currentPlayer = player ?: return
+        if (
+            _state.value.firstVideoFrameRendered ||
+            !currentPlayer.playWhenReady ||
+            currentPlayer.playbackState != Player.STATE_READY ||
+            firstFrameTimeoutJob?.isActive == true
+        ) {
+            return
+        }
+
+        val startedAtMs = SystemClock.elapsedRealtime()
+        firstFrameTimeoutStartedAtMs = startedAtMs
+        firstFrameTimeoutJob = viewModelScope.launch {
+            delay(firstFrameTimeoutRemainingMs)
+            firstFrameTimeoutRemainingMs = 0L
+            firstFrameTimeoutStartedAtMs = null
+            firstFrameTimeoutJob = null
+            if (
+                player !== currentPlayer ||
+                _state.value.firstVideoFrameRendered ||
+                !currentPlayer.playWhenReady ||
+                currentPlayer.playbackState != Player.STATE_READY
+            ) {
+                return@launch
+            }
+
+            val videoGroups = currentPlayer.currentTracks.groups.filter {
+                it.type == C.TRACK_TYPE_VIDEO
+            }
+            val hasSupportedVideo = videoGroups.any { group ->
+                (0 until group.length).any(group::isTrackSupported)
+            }
+            val firstFormat = videoGroups.firstOrNull()?.getTrackFormat(0)
+            val codec = firstFormat?.sampleMimeType ?: firstFormat?.codecs ?: "unknown codec"
+            val dimensions = firstFormat?.height?.takeIf { it > 0 }?.let { " ${it}p" }.orEmpty()
+            val detail = when {
+                videoGroups.isEmpty() ->
+                    "The selected source has no video track. Choose another source or title."
+                !hasSupportedVideo -> {
+                    "This device cannot decode the source video format ($codec$dimensions). " +
+                        "Choose another source or device."
+                }
+                else ->
+                    "No video frame arrived for $codec$dimensions after " +
+                        "${FIRST_VIDEO_FRAME_TIMEOUT_MS / 1_000} seconds of playback. " +
+                        "Try another source; this stream may be damaged or incompatible with this device."
+            }
+            Log.w(
+                TAG,
+                "First-frame timeout: codec=$codec height=${firstFormat?.height} " +
+                    "videoGroups=${videoGroups.size} supported=$hasSupportedVideo",
+            )
+            currentPlayer.pause()
+            _state.value = _state.value.copy(
+                status = PlayerStatus.ERROR,
+                showError = true,
+                errorRetryable = true,
+                errorDetail = detail,
+            )
+        }
+    }
+
+    private fun pauseFirstFrameTimeout() {
+        val startedAtMs = firstFrameTimeoutStartedAtMs ?: return
+        firstFrameTimeoutRemainingMs = (
+            firstFrameTimeoutRemainingMs - (SystemClock.elapsedRealtime() - startedAtMs)
+        ).coerceAtLeast(0L)
+        firstFrameTimeoutStartedAtMs = null
+        firstFrameTimeoutJob?.cancel()
+        firstFrameTimeoutJob = null
+    }
+
+    private fun resetFirstFrameTimeout() {
+        firstFrameTimeoutJob?.cancel()
+        firstFrameTimeoutJob = null
+        firstFrameTimeoutStartedAtMs = null
+        firstFrameTimeoutRemainingMs = FIRST_VIDEO_FRAME_TIMEOUT_MS
     }
 
     // ------------------------------------------------------------------ controls
@@ -456,6 +604,7 @@ class PlayerViewModel(
         val out = mutableListOf<TrackOption>()
         current.groups.forEach { group ->
             val type = group.type
+            val manualOverride = p.trackSelectionParameters.overrides[group.mediaTrackGroup]
             for (i in 0 until group.length) {
                 if (!group.isTrackSupported(i)) continue
                 val fmt = group.getTrackFormat(i)
@@ -463,18 +612,19 @@ class PlayerViewModel(
                     androidx.media3.common.C.TRACK_TYPE_VIDEO ->
                         listOfNotNull(
                             fmt.height.takeIf { it > 0 }?.let { "${it}p" },
-                            fmt.sampleMimeType?.substringAfter('/')?.takeIf { it.isNotEmpty() },
+                            fmt.bitrate.takeIf { it > 0 }?.let { bitrate ->
+                                "${(bitrate / 1_000_000f).roundToLong()} Mbps"
+                            },
                         ).joinToString(" / ").ifBlank { "Video" }
                     androidx.media3.common.C.TRACK_TYPE_AUDIO ->
                         listOfNotNull(
-                            readableLanguage(fmt.language ?: fmt.label ?: "Audio"),
+                            readableLanguage(fmt.language, fmt.label, "Audio ${i + 1}"),
                             fmt.channelCount.takeIf { (it ?: 0) > 0 }?.let { "$it ch" },
                         ).joinToString(" · ")
                     androidx.media3.common.C.TRACK_TYPE_TEXT ->
-                        readableLanguage(fmt.language ?: fmt.label ?: "Subtitles")
+                        readableLanguage(fmt.language, fmt.label, "Subtitle ${i + 1}")
                     else -> continue
                 }
-                val trackUid = "$type|${group.mediaTrackGroup.id}|$i"
                 out.add(
                     TrackOption(
                         type = when (type) {
@@ -483,9 +633,12 @@ class PlayerViewModel(
                             else -> "text"
                         },
                         label = label,
-                        trackUid = trackUid,
-                        selected = group.isTrackSelected(i),
-                        override = null,
+                        selected = if (type == androidx.media3.common.C.TRACK_TYPE_TEXT) {
+                            group.isTrackSelected(i)
+                        } else {
+                            manualOverride?.trackIndices?.contains(i) == true
+                        },
+                        override = TrackSelectionOverride(group.mediaTrackGroup, listOf(i)),
                     ),
                 )
             }
@@ -493,81 +646,60 @@ class PlayerViewModel(
         return out
     }
 
-    /** Maps ISO-639-1 language codes to readable names; falls back to the code itself. */
-    private fun readableLanguage(code: String): String = when (code.lowercase()) {
-        "en" -> "English"
-        "hi" -> "Hindi"
-        "ta" -> "Tamil"
-        "te" -> "Telugu"
-        "bn" -> "Bengali"
-        "mr" -> "Marathi"
-        "gu" -> "Gujarati"
-        "kn" -> "Kannada"
-        "ml" -> "Malayalam"
-        "pa" -> "Punjabi"
-        "es" -> "Spanish"
-        "fr" -> "French"
-        "de" -> "German"
-        "it" -> "Italian"
-        "pt" -> "Portuguese"
-        "ru" -> "Russian"
-        "ja" -> "Japanese"
-        "ko" -> "Korean"
-        "zh" -> "Chinese"
-        "ar" -> "Arabic"
-        else -> code.replaceFirstChar { it.uppercase() }
+    private fun readableLanguage(language: String?, label: String?, fallback: String): String {
+        val normalizedLanguage = language?.takeUnless { it.isBlank() || it == "und" }
+        val displayName = normalizedLanguage?.let {
+            java.util.Locale.forLanguageTag(it).getDisplayLanguage(java.util.Locale.getDefault())
+        }?.takeUnless { it.isBlank() || it == normalizedLanguage }
+        return displayName ?: label?.takeIf { it.isNotBlank() } ?: fallback
     }
 
     fun selectTrack(option: TrackOption) {
         val p = player ?: return
-        val builder = p.trackSelectionParameters.buildUpon()
-        when (option.type) {
-            "text" -> {
-                builder.setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, false)
-                overrideForOption(builder, option)
-            }
-            else -> overrideForOption(builder, option)
-        }
-        p.trackSelectionParameters = builder.build()
+        val trackType = trackTypeFor(option.type) ?: return
+        val override = option.override ?: return
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(trackType)
+            .setTrackTypeDisabled(trackType, false)
+            .setOverrideForType(override)
+            .build()
         publishPlayerSnapshot()
     }
 
-    private fun overrideForOption(builder: TrackSelectionParameters.Builder, option: TrackOption) {
-        val override = overrideForUid(option.trackUid) ?: return
-        builder.setOverrideForType(override)
-    }
-
-    private fun overrideForUid(trackUid: String): TrackSelectionOverride? {
-        val playerRef = player ?: return null
-        val parts = trackUid.split("|")
-        if (parts.size != 3) return null
-        val typeFlag = parts[0].toInt()
-        val groupUid = parts[1]
-        val index = parts[2].toInt()
-        val group = playerRef.currentTracks.groups.firstOrNull {
-            it.type == typeFlag && it.mediaTrackGroup.id == groupUid
-        } ?: return null
-        return TrackSelectionOverride(group.mediaTrackGroup, listOf(index))
-    }
-
-    fun toggleSubtitles() {
+    fun selectAutomaticTrack(type: String) {
         val p = player ?: return
-        val disabled = p.trackSelectionParameters.disabledTrackTypes
-            .contains(androidx.media3.common.C.TRACK_TYPE_TEXT)
+        val trackType = trackTypeFor(type) ?: return
         p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
-            .setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, !disabled)
+            .clearOverridesOfType(trackType)
+            .setTrackTypeDisabled(trackType, false)
             .build()
+        publishPlayerSnapshot()
     }
 
-    fun subtitlesAvailable(): Boolean {
-        val p = player ?: return false
-        return p.currentTracks.groups.any { it.type == androidx.media3.common.C.TRACK_TYPE_TEXT && it.length > 0 }
+    fun disableSubtitles() {
+        val p = player ?: return
+        p.trackSelectionParameters = p.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(androidx.media3.common.C.TRACK_TYPE_TEXT)
+            .setTrackTypeDisabled(androidx.media3.common.C.TRACK_TYPE_TEXT, true)
+            .build()
+        publishPlayerSnapshot()
     }
 
-    fun subtitlesEnabled(): Boolean = player
-        ?.trackSelectionParameters
-        ?.disabledTrackTypes
-        ?.contains(androidx.media3.common.C.TRACK_TYPE_TEXT) == false
+    private fun trackTypeFor(type: String): Int? = when (type) {
+        "video" -> androidx.media3.common.C.TRACK_TYPE_VIDEO
+        "audio" -> androidx.media3.common.C.TRACK_TYPE_AUDIO
+        "text" -> androidx.media3.common.C.TRACK_TYPE_TEXT
+        else -> null
+    }
+
+    private fun isTrackTypeAutomatic(p: ExoPlayer, trackType: Int): Boolean {
+        val overriddenGroups = p.trackSelectionParameters.overrides.keys
+        return overriddenGroups.none { overrideGroup ->
+            p.currentTracks.groups.any { group ->
+                group.type == trackType && group.mediaTrackGroup == overrideGroup
+            }
+        }
+    }
 
     // --------------------------------------------------------- episode navigation
 
@@ -645,6 +777,7 @@ class PlayerViewModel(
         cancelAutoNext()
         resolveJob?.cancel()
         resolveJob = null
+        resetFirstFrameTimeout()
         tickJob?.cancel()
         tickJob = null
         persistProgress()
@@ -682,5 +815,6 @@ class PlayerViewModel(
     companion object {
         const val EXO_UA = "ExoPlayerLib/2.18.7"
         private const val PROGRESS_SAVE_INTERVAL_MS = 15_000L
+        private const val FIRST_VIDEO_FRAME_TIMEOUT_MS = 15_000L
     }
 }
