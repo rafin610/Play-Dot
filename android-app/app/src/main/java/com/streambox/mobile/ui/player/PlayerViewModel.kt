@@ -15,6 +15,7 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.common.util.UnstableApi
@@ -350,7 +351,17 @@ class PlayerViewModel(
                 .setAllowCrossProtocolRedirects(true)
                 .setDefaultRequestProperties(headers)
 
-            newPlayer = ExoPlayer.Builder(appContext)
+            // Some phones expose more than one decoder for the same codec. The
+            // provider stream may be accepted by the first decoder (audio starts
+            // and the player reaches READY) while that decoder never produces a
+            // video frame. Let Media3 fall back to another available decoder
+            // before the first-frame watchdog reports a false black-screen
+            // failure. This does not add a software codec; it only makes the
+            // hardware-decoder selection more tolerant.
+            val renderersFactory = DefaultRenderersFactory(appContext)
+                .setEnableDecoderFallback(true)
+
+            newPlayer = ExoPlayer.Builder(appContext, renderersFactory)
                 .setMediaSourceFactory(DefaultMediaSourceFactory(dataSourceFactory))
                 .setLoadControl(loadControl)
                 .setAudioAttributes(
