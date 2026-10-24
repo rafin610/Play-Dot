@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Only the app-private update cache is shared, and only with the system
+     package installer for the duration of one grant-uri-permission intent. -->
+<paths>
+    <cache-path
+        name="updates"
+        path="updates/" />
+</paths>

@@ -165,6 +165,13 @@ Many regional streams are only served in the HEVC (H.265) compression format, wh
 *   **Subprocess Transcoding**: The backend uses an asynchronous `ffmpeg` subprocess to dynamically transcode the HEVC stream into a standard H.264 stream in real-time, allowing browser playback on any device.
 
 ### **Phase 5: Anti-Piracy Dummy Video Bypass (v4.0.02+)**
+
+> **Historical reverse-engineering evidence only.** This section is not an
+> implementation instruction. Play Dot does not implement or deploy this
+> bypass. If the provider returns a legacy/dummy notice, use the official
+> current client or a licensed source. The supported migration path is
+> documented in [`docs/UPDATE_SYSTEM.md`](docs/UPDATE_SYSTEM.md).
+
 In newer versions, the API deliberately attempts to trap unofficial clients and scrapers.
 *   **The Trap:** The `/wefeed-mobile-bff/subject-api/play-info` endpoint returns a valid-looking `url` field containing an `.mp4` stream. However, this is actually a fake 21-second "Please update your app" dummy video meant to break unofficial scrapers.
 *   **Discovery Note:** This trap was reverse-engineered by observing a critical discrepancy in the `play-info` API response. The response returned a video `duration` of `1427` seconds (~23 minutes, the exact length of a standard anime episode), but the actual media player only played a 21-second video from the primary `url` field (`https://macdn.aoneroom.com/other/.../b164fbfb43477929...mp4`). The metadata proved the API knew the real video duration but was deliberately serving the wrong file link.

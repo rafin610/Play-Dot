@@ -81,11 +81,56 @@ Frontend runs on **http://localhost:3001**
 
 ### Production backend / Android build
 
-A Render Blueprint is provided in `render.yaml`; it is prepared but not
-deployed, and automatic deploys are disabled. Follow
+A Render Blueprint is provided in `render.yaml`; automatic deploys are disabled.
+The release APK currently targets the existing public origin
+`https://play-dot.onrender.com/`, but that live service predates the
+`/app-update` work and does not yet expose an update artifact. Follow
 [`docs/RENDER_DEPLOYMENT_GUIDE.md`](docs/RENDER_DEPLOYMENT_GUIDE.md) for secret
-setup, health checks, rollback, and building the Android release APK against the
-actual HTTPS origin. Do not invent or commit a Render URL.
+setup, health checks, update/APK hosting, rollback, and rebuilding the Android
+release APK against the actual HTTPS origin. Do not invent or commit a Render
+URL.
+
+### Android in-app updates
+
+Release `1.1.0` (versionCode `3`) includes a direct-APK updater. It checks
+`GET /app-update` after the first frame, compares version codes, and shows an
+optional or mandatory dialog. The client validates an HTTPS APK URL, streams the
+APK with a size cap, verifies its SHA-256/size when published, checks the package
+ID/version/signing certificate against the installed app, and then opens the
+Android system installer through a cache-only FileProvider. It never installs
+silently and does not use Google Play In-App Updates.
+
+The endpoint is intentionally session-independent:
+
+```json
+{
+  "latestVersionCode": 3,
+  "latestVersionName": "1.1.0",
+  "minimumSupportedVersionCode": 1,
+  "releaseNotes": "Playback stability fixes and the new in-app updater.",
+  "apkUrl": "https://releases.example.com/play-dot-1.1.0.apk",
+  "packageName": "com.streambox.mobile",
+  "sha256": "166a92061a99af55345cb24b0b488be251298d880467a03bdc733539a619cbc8",
+  "sizeBytes": 15964391
+}
+```
+
+Configuration is by environment variable (`APP_UPDATE_*`); see
+[`docs/UPDATE_SYSTEM.md`](docs/UPDATE_SYSTEM.md) for the full contract, hosting
+options, deployment steps, verification results, and rollback notes. The old
+live backend does not expose this route yet, so a release client silently skips
+the check (`404`/`503` is intentionally non-intrusive). The signed APK is local
+only; no public production artifact was uploaded.
+
+### Provider playback notice
+
+For at least the tested episode, the provider served a 22.7-second
+“VERSION LEGACY / SUPPORT ENDING” placeholder video instead of the requested
+content. It is inside the media stream, not Play Dot UI or signing, and cannot
+be removed by an app update. The supported path is the official current MovieBox
+client or a licensed source. This repository does not implement or deploy an
+anti-piracy bypass; see
+[`docs/UPDATE_SYSTEM.md`](docs/UPDATE_SYSTEM.md#1-provider-banner-root-cause-and-status).
 
 ---
 
@@ -316,45 +361,66 @@ Resolve the playback URL for a movie or episode.
 | `episode` | `1` | Episode number |
 | `quality` | `720p` | Stream quality (360p, 480p, 720p, 1080p) |
 
-**Response (Standard H.264 stream):**
+**Response (native provider stream plus compatibility metadata):**
 ```json
 {
   "url": "https://cdn.example.com/video.mp4",
-  "quality": "720P",
   "cookie": "signCookie=...",
+  "duration": 8280,
+  "isHls": false,
+  "isDash": false,
+  "mimeType": "video/mp4",
+  "videoCodec": "hevc",
+  "audioCodec": "aac",
+  "videoWidth": 850,
+  "videoHeight": 480,
+  "isTranscoded": false,
+  "compatUrl": "/play-compat/1234567890123456789?season=1&episode=1&quality=480p",
+  "selectedQuality": "480p",
+  "qualityList": ["480p", "720p"],
   "subtitles": [ { "lanName": "English", "url": "..." } ],
   "streamId": "..."
 }
 ```
 
-**Response (Auto-transcoded H.265 stream):**
-```json
-{
-  "url": "http://localhost:8000/play-compat/{subject_id}?season=1&episode=1&quality=720P",
-  "cookie": "",
-  "isTranscoded": true,
-  "runtime": "24"
-}
-```
-
-> When `isTranscoded: true`, the frontend automatically routes through the FFMPEG transcode pipe. No manual action needed.
+> `url` always remains the provider's native stream. `isTranscoded` is `false`
+> here; the `/stream` endpoint never rewrites `url` to the compatibility pipe.
+> Android resolves the relative `compatUrl` against its configured backend,
+> prefers the native stream when its codec is usable, and switches to the
+> compatibility stream only when the device lacks the codec or no video frame
+> arrives within the first-frame watchdog.
 
 ---
 
-#### `GET /play-compat/{subject_id}?season=1&episode=1&quality=720P&start_time=0`
-**FFMPEG Live Transcode Pipe** — converts HEVC/H.265 to browser-native H.264 fMP4.
+#### `GET /play-compat/{subject_id}?season=1&episode=1&quality=480p&start_time=0`
+**On-demand H.264/AAC compatibility stream** for devices that cannot decode the
+provider's native HEVC/H.265 rendition.
 
-Streams video directly to the browser. Supports `HEAD` requests for range negotiation.
+Returns a fragmented MP4 (H.264 Constrained Baseline 480p video, AAC stereo
+48 kHz audio) generated by FFmpeg. It is a fallback, not the normal path. The
+video is scaled to 480p and capped in bitrate to bound server CPU.
+
+- `HEAD` validates the request and reports the same headers without transcoding.
+- `Accept-Ranges: none` and `Cache-Control: no-store`; clients must start at 0.
+- `start_time` performs an input seek before the transcoder starts.
+- One concurrent transcode per server process by default; excess requests get
+  `429` rather than queueing indefinitely.
+- Invalid IDs/quality/range -> `400`; missing FFmpeg -> `503`; upstream or
+  transcoder failure -> `502`.
+- The resolver's native URL is SSRF-validated before FFmpeg receives it.
+- The transcoder is killed when the client disconnects or the maximum duration
+  is reached.
 
 **Query Params:**
 | Param | Default | Description |
 |---|---|---|
 | `season` | `1` | Season number |
 | `episode` | `1` | Episode number |
-| `quality` | `720P` | Quality level |
-| `start_time` | `0` | Seek to this second before transcoding |
+| `quality` | `480p` | Requested provider quality (normalized; `auto` -> `720p`) |
+| `start_time` | `0` | Seek position in seconds (0-86400) |
 
-> **This endpoint requires FFMPEG to be installed** and in the system PATH.
+> **This endpoint requires FFmpeg** in the system PATH. Production deployments
+> must install it and deploy this route for the fallback to be available.
 
 ---
 

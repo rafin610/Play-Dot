@@ -34,3 +34,9 @@ services:
       # Set this to the exact HTTPS dashboard origin when the dashboard is deployed.
       - key: CORS_ORIGINS
         sync: false
+      # In-app update settings are optional. Configure APP_UPDATE_APK_URL (public
+      # HTTPS), APP_UPDATE_LATEST_VERSION_CODE, APP_UPDATE_LATEST_VERSION_NAME,
+      # APP_UPDATE_MINIMUM_VERSION_CODE, APP_UPDATE_APK_SHA256, and
+      # APP_UPDATE_APK_SIZE_BYTES in the Render dashboard only after a signed
+      # APK is hosted. See docs/UPDATE_SYSTEM.md. Leave unset to keep
+      # /app-update returning 503.

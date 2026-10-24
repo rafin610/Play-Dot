@@ -4,6 +4,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.ContextWrapper
 import android.content.pm.ActivityInfo
+import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility as OverlayVisibility
 import androidx.compose.animation.fadeIn
@@ -55,6 +56,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -72,6 +74,7 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.doOnLayout
 import androidx.media3.ui.PlayerView
 import com.streambox.mobile.R
 import com.streambox.mobile.ui.components.ErrorState
@@ -82,6 +85,7 @@ import com.streambox.mobile.ui.theme.AppTextSecondary
 import kotlinx.coroutines.delay
 
 private const val SEEK_DELTA_MS = 10_000L
+private const val TAG = "PlayerScreen"
 
 /**
  * Phase 3 player screen with premium streaming UI:
@@ -171,20 +175,48 @@ fun PlayerScreen(
             },
         ) {
             // --- video surface ---
-            AndroidView(
-                factory = { ctx ->
-                    android.view.LayoutInflater.from(ctx)
-                        .inflate(R.layout.player_view, null, false) as PlayerView
-                },
-                update = { view -> view.player = viewModel.player },
-                onRelease = { view -> view.player = null },
-                modifier = Modifier.fillMaxSize(),
-            )
+            // AndroidView does not necessarily invoke `update` again while its
+            // parameters stay the same. Keying by the actual player forces a
+            // fresh PlayerView when the ViewModel creates/replaces the player;
+            // otherwise the surface can remain bound to the previous (released)
+            // player, leaving a black screen with only audio.
+            val currentPlayer = viewModel.player
+            key(currentPlayer) {
+                AndroidView(
+                    factory = { ctx ->
+                        (android.view.LayoutInflater.from(ctx)
+                            .inflate(R.layout.player_view, null, false) as PlayerView).also { view ->
+                            // A zero-size surface produces a black screen even when
+                            // the decoder is healthy. Keep one diagnostic line.
+                            view.doOnLayout { laidOut ->
+                                Log.i(
+                                    TAG,
+                                    "PlayerView laid out ${laidOut.width}x${laidOut.height}",
+                                )
+                            }
+                        }
+                    },
+                    update = { view ->
+                        if (view.player !== currentPlayer) {
+                            Log.i(
+                                TAG,
+                                "PlayerView attaching player=${currentPlayer?.hashCode() ?: 0} " +
+                                    "usingCompat=${state.usingCompatStream}",
+                            )
+                        }
+                        view.player = currentPlayer
+                    },
+                    onRelease = { view -> view.player = null },
+                    modifier = Modifier.fillMaxSize(),
+                )
+            }
 
             // --- center state overlays ---
             when (state.status) {
                 PlayerStatus.RESOLVING -> OverlayPanel("Resolving source…")
-                PlayerStatus.PREPARING, PlayerStatus.BUFFERING -> OverlayPanel("Loading…")
+                PlayerStatus.PREPARING, PlayerStatus.BUFFERING -> OverlayPanel(
+                    if (state.usingCompatStream) "Optimizing video for this device…" else "Loading…",
+                )
                 PlayerStatus.ERROR, PlayerStatus.UNAVAILABLE -> {
                     ErrorState(
                         title = if (state.status == PlayerStatus.ERROR) "Playback error" else "Source unavailable",

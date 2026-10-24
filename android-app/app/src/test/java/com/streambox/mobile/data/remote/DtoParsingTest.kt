@@ -168,6 +168,15 @@ class DtoParsingTest {
                            "url":"https://cdn.example.test/subs/fixture.en.srt"}],
              "subtitle_url":null,
              "isHls":false,
+             "isDash":false,
+             "mimeType":"video/mp4",
+             "videoCodec":"hevc",
+             "audioCodec":"aac",
+             "videoWidth":850,
+             "videoHeight":480,
+             "isTranscoded":false,
+             "compatUrl":"/play-compat/123456789012345678?season=1&episode=1&quality=480p",
+             "selectedQuality":"480p",
              "streamId":"5f7d",
              "qualityList":[],
              "season":1,
@@ -179,6 +188,18 @@ class DtoParsingTest {
         assertEquals("<signing-cookie-stub>", stream.cookie)
         assertEquals(13680L, stream.duration)
         assertEquals(false, stream.isHls)
+        assertEquals(false, stream.isDash)
+        assertEquals("video/mp4", stream.mimeType)
+        assertEquals("hevc", stream.videoCodec)
+        assertEquals("aac", stream.audioCodec)
+        assertEquals(850, stream.videoWidth)
+        assertEquals(480, stream.videoHeight)
+        assertEquals(false, stream.isTranscoded)
+        assertEquals(
+            "/play-compat/123456789012345678?season=1&episode=1&quality=480p",
+            stream.compatUrl,
+        )
+        assertEquals("480p", stream.selectedQuality)
         assertEquals("5f7d", stream.streamId)
         assertTrue(stream.qualityList.isEmpty())
         assertEquals(1, stream.subtitles.size)
@@ -206,6 +227,25 @@ class DtoParsingTest {
         assertEquals(listOf("720P", "1080P"), stream.qualityList)
         assertNull(stream.cookie)
         assertTrue(stream.subtitles.isEmpty())
+    }
+
+    @Test
+    fun `stream response tolerates an older backend without metadata fields`() {
+        val payload = """
+            {"url":"https://cdn.example.test/video/legacy.mp4","duration":1200,
+             "isHls":false,"subtitles":[],"streamId":"legacy"}
+        """.trimIndent()
+
+        val stream = json.decodeFromString(StreamResponse.serializer(), payload)
+        assertEquals("https://cdn.example.test/video/legacy.mp4", stream.url)
+        assertNull(stream.mimeType)
+        assertNull(stream.videoCodec)
+        assertNull(stream.audioCodec)
+        assertNull(stream.compatUrl)
+        assertNull(stream.selectedQuality)
+        assertEquals(0, stream.videoWidth)
+        assertEquals(0, stream.videoHeight)
+        assertEquals(false, stream.isTranscoded)
     }
 
     @Test

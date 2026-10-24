@@ -6,6 +6,11 @@
 **Deployment status:** **Not deployed.** No Render service, public hostname, or production APK was created.
 **Scope:** backend API, Android client, security/failure behavior, Render readiness, tests, and local integration evidence.
 
+> **Historical report:** the APK/version/hash details below describe the earlier
+> `1.0.0-playdot` (versionCode 2) build. The current release is `1.1.0`
+> (versionCode 3); see [`UPDATE_SYSTEM.md`](UPDATE_SYSTEM.md) for the updater,
+> current artifact, provider-banner audit, and production blockers.
+
 This report distinguishes three levels of evidence:
 
 1. **Mocked tests** — deterministic offline provider fakes; prove adapter contracts and error handling.

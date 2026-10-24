@@ -1,13 +1,16 @@
 from fastapi import FastAPI, HTTPException, Query, Response, Cookie, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 import httpx
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from typing import Optional, List, Dict
+from pathlib import Path
 from pydantic import BaseModel
 import uvicorn
 import os
 import subprocess
 import shutil
+import hashlib
 import base64
 import json
 import asyncio
@@ -126,19 +129,19 @@ def _normalize_subtitles(items) -> List[dict]:
     return normalized
 
 
-def _validate_public_http_url(raw_url: str) -> str:
+def _validate_public_http_url(raw_url: str, label: str = "subtitle") -> str:
     """Reject SSRF targets (private/loopback/link-local/metadata hosts)."""
     if not isinstance(raw_url, str) or not raw_url.strip():
-        raise HTTPException(status_code=400, detail="A subtitle URL is required.")
+        raise HTTPException(status_code=400, detail=f"A {label} URL is required.")
     parsed = urlparse(raw_url.strip())
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
-        raise HTTPException(status_code=400, detail="Only absolute http(s) subtitle URLs are supported.")
+        raise HTTPException(status_code=400, detail=f"Only absolute http(s) {label} URLs are supported.")
     if parsed.username or parsed.password:
-        raise HTTPException(status_code=400, detail="Credentials in subtitle URLs are not supported.")
+        raise HTTPException(status_code=400, detail=f"Credentials in {label} URLs are not supported.")
 
     host = parsed.hostname.lower().rstrip(".")
     if host == "localhost" or host.endswith(".localhost") or host.endswith(".local") or host.endswith(".internal"):
-        raise HTTPException(status_code=400, detail="Subtitle host is not public.")
+        raise HTTPException(status_code=400, detail=f"{label.capitalize()} host is not public.")
 
     try:
         addresses = {
@@ -146,18 +149,182 @@ def _validate_public_http_url(raw_url: str) -> str:
             for info in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
         }
     except OSError:
-        raise HTTPException(status_code=400, detail="Subtitle host could not be resolved.")
+        raise HTTPException(status_code=400, detail=f"{label.capitalize()} host could not be resolved.")
 
     if not addresses:
-        raise HTTPException(status_code=400, detail="Subtitle host could not be resolved.")
+        raise HTTPException(status_code=400, detail=f"{label.capitalize()} host could not be resolved.")
     for address in addresses:
         try:
             ip = ipaddress.ip_address(address.split("%", 1)[0])
         except ValueError:
-            raise HTTPException(status_code=400, detail="Subtitle host resolved to an invalid address.")
+            raise HTTPException(status_code=400, detail=f"{label.capitalize()} host resolved to an invalid address.")
         if not ip.is_global:
-            raise HTTPException(status_code=400, detail="Subtitle host is not public.")
+            raise HTTPException(status_code=400, detail=f"{label.capitalize()} host is not public.")
     return raw_url.strip()
+
+
+def _media_cookie_value(raw_cookie: str) -> str:
+    """Normalize a provider cookie without ever logging it."""
+    raw = (raw_cookie or "").strip()
+    if not raw:
+        return ""
+    return raw if "=" in raw else f"signCookie={raw}"
+
+
+def _media_upstream_headers(cookie: str) -> Dict[str, str]:
+    """Headers the media CDN expects for both probing and compatibility playback."""
+    headers = {
+        "Referer": "https://apig.inmoviebox.com/",
+        "Origin": "https://apig.inmoviebox.com",
+        "User-Agent": "ExoPlayerLib/2.18.7",
+    }
+    cookie_value = _media_cookie_value(cookie)
+    if cookie_value:
+        headers["Cookie"] = cookie_value
+    return headers
+
+
+def _ffmpeg_http_headers(cookie: str) -> str:
+    return "".join(
+        f"{key}: {value}\r\n"
+        for key, value in _media_upstream_headers(cookie).items()
+    )
+
+
+def _normalize_video_codec(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    if not normalized:
+        return "unknown"
+    if any(marker in normalized for marker in ("hevc", "h265", "hev1", "hvc1")):
+        return "hevc"
+    if any(marker in normalized for marker in ("avc1", "h264", "avc")):
+        return "h264"
+    if normalized.startswith("av01") or normalized == "av1":
+        return "av1"
+    if "vp09" in normalized or normalized == "vp9":
+        return "vp9"
+    return "unknown"
+
+
+def _normalize_audio_codec(value: str) -> str:
+    normalized = re.sub(r"[^a-z0-9]", "", str(value or "").lower())
+    if not normalized:
+        return "unknown"
+    if "aac" in normalized or "mp4a" in normalized:
+        return "aac"
+    if "eac3" in normalized or "ec3" in normalized:
+        return "eac3"
+    if "ac3" in normalized:
+        return "ac3"
+    if "opus" in normalized:
+        return "opus"
+    return "unknown"
+
+
+def _stream_type_from_url(url: str, container: str = "") -> str:
+    path = urlparse(url or "").path.lower()
+    if path.endswith(".m3u8"):
+        return "hls"
+    if path.endswith(".mpd"):
+        return "dash"
+    if path.endswith((".mp4", ".m4v")):
+        return "mp4"
+    normalized = (container or "").lower()
+    if "dash" in normalized:
+        return "dash"
+    if "hls" in normalized or "applehttp" in normalized:
+        return "hls"
+    if "mp4" in normalized or "mov" in normalized:
+        return "mp4"
+    return "unknown"
+
+
+def _mime_type_for_stream(stream_type: str) -> str:
+    return {
+        "hls": "application/vnd.apple.mpegurl",
+        "dash": "application/dash+xml",
+        "mp4": "video/mp4",
+    }.get(stream_type, "application/octet-stream")
+
+
+def _probe_media(url: str, cookie: str = "") -> Dict:
+    """Inspect the real container/codecs without logging the signed URL.
+
+    A URL suffix is not evidence of a codec: provider MP4s are frequently
+    HEVC. ffprobe reads only the headers for progressive MP4, and the timeout
+    keeps a slow manifest/CDN from delaying stream resolution indefinitely.
+    """
+    if not url:
+        return {}
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return {}
+    try:
+        _validate_public_http_url(url, label="media")
+    except HTTPException:
+        return {}
+
+    cmd = [
+        ffprobe,
+        "-v", "error",
+        "-hide_banner",
+        "-show_entries",
+        "format=format_name,duration:stream=codec_type,codec_name,profile,width,height,channels,sample_rate",
+        "-of", "json",
+        "-headers", _ffmpeg_http_headers(cookie),
+        url,
+    ]
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=FFPROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(proc.stdout or "{}")
+    except (TypeError, ValueError):
+        return {}
+    streams = payload.get("streams") or []
+    if not isinstance(streams, list):
+        streams = []
+    video = next(
+        (s for s in streams if isinstance(s, dict) and s.get("codec_type") == "video"),
+        None,
+    )
+    audio = next(
+        (s for s in streams if isinstance(s, dict) and s.get("codec_type") == "audio"),
+        None,
+    )
+    fmt = payload.get("format") or {}
+    if not isinstance(fmt, dict):
+        fmt = {}
+    result = {
+        "hasVideo": video is not None,
+        "hasAudio": audio is not None,
+        "videoCodec": _normalize_video_codec(video.get("codec_name")) if video else "unknown",
+        "audioCodec": _normalize_audio_codec(audio.get("codec_name")) if audio else "unknown",
+        "container": str(fmt.get("format_name") or ""),
+    }
+    for key in ("width", "height"):
+        try:
+            result[key] = int(video.get(key) or 0) if video else 0
+        except (TypeError, ValueError):
+            result[key] = 0
+    for key in ("channels", "sample_rate"):
+        try:
+            result[key] = int(audio.get(key) or 0) if audio else 0
+        except (TypeError, ValueError):
+            result[key] = 0
+    try:
+        result["duration"] = float(fmt.get("duration") or 0)
+    except (TypeError, ValueError):
+        result["duration"] = 0.0
+    return result
 
 
 @asynccontextmanager
@@ -202,10 +369,158 @@ def health_check():
         "service": SERVICE_NAME,
         "version": APP_VERSION,
         "guest_token": guest_token_status(),
+        "features": {
+            "play_compat": bool(shutil.which("ffmpeg")),
+            "media_probe": bool(shutil.which("ffprobe")),
+        },
     }
     if warnings:
         payload["warnings"] = warnings
     return payload
+
+
+# ---------------------------------------------------------------------------
+# App update metadata
+#
+# The Android client checks this endpoint asynchronously. It is intentionally
+# independent of provider sessions: an update check must work even when the
+# MovieBox guest token is unavailable. The APK itself can be served by this
+# backend only when APP_UPDATE_APK_PATH points at a real file; production should
+# normally publish the APK to HTTPS storage and set APP_UPDATE_APK_URL.
+# ---------------------------------------------------------------------------
+
+def _update_int_env(name: str, default: int, minimum: int = 0) -> int:
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s; using %s", name, default)
+        return default
+    if value < minimum:
+        logger.warning("Invalid %s below minimum; using %s", name, default)
+        return default
+    return value
+
+
+def _update_apk_path() -> Optional[Path]:
+    raw = os.getenv("APP_UPDATE_APK_PATH", "").strip()
+    if not raw:
+        return None
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    return path if path.is_file() else None
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid_update_url(raw: str) -> bool:
+    """Require HTTPS, except for the narrow local emulator test origin."""
+    try:
+        parsed = urlparse(raw.strip())
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    if parsed.username or parsed.password:
+        return False
+    if parsed.scheme == "https":
+        return True
+    return parsed.hostname.lower() in {"10.0.2.2", "localhost", "127.0.0.1"}
+
+
+def _app_update_payload(request: Request) -> dict:
+    apk_path = _update_apk_path()
+    apk_url = os.getenv("APP_UPDATE_APK_URL", "").strip()
+    if not apk_url and apk_path:
+        # Local/self-hosted fallback. Behind a TLS proxy this becomes HTTPS
+        # automatically because the request scheme is https.
+        apk_url = f"{str(request.base_url).rstrip('/')}/app-release.apk"
+    if not apk_url:
+        raise HTTPException(
+            status_code=503,
+            detail="App update metadata is not configured.",
+        )
+    if not _valid_update_url(apk_url):
+        logger.warning("APP_UPDATE_APK_URL is not an allowed release URL")
+        raise HTTPException(
+            status_code=503,
+            detail="App update metadata has an invalid APK URL.",
+        )
+
+    latest_code = _update_int_env("APP_UPDATE_LATEST_VERSION_CODE", 3, minimum=1)
+    minimum_code = _update_int_env("APP_UPDATE_MINIMUM_VERSION_CODE", 1, minimum=0)
+    if minimum_code > latest_code:
+        logger.warning("APP_UPDATE_MINIMUM_VERSION_CODE is greater than latest; ignoring")
+        raise HTTPException(
+            status_code=503,
+            detail="App update metadata has an invalid minimum version.",
+        )
+
+    payload = {
+        "latestVersionCode": latest_code,
+        "latestVersionName": os.getenv("APP_UPDATE_LATEST_VERSION_NAME", "1.1.0").strip() or "1.1.0",
+        "minimumSupportedVersionCode": minimum_code,
+        "releaseNotes": os.getenv(
+            "APP_UPDATE_RELEASE_NOTES",
+            "Bug fixes and playback improvements.",
+        ).strip() or "Bug fixes and playback improvements.",
+        "apkUrl": apk_url,
+        "packageName": os.getenv("APP_UPDATE_PACKAGE_NAME", "com.streambox.mobile").strip()
+        or "com.streambox.mobile",
+    }
+
+    # A self-hosted file can be hashed/sized on demand. If a remote URL is
+    # used, operators should set these two values from the published artifact.
+    sha = os.getenv("APP_UPDATE_APK_SHA256", "").strip().lower()
+    try:
+        size = int(os.getenv("APP_UPDATE_APK_SIZE_BYTES", "0").strip() or "0")
+    except (TypeError, ValueError):
+        size = 0
+    if apk_path:
+        if not sha:
+            sha = _sha256_file(apk_path)
+        if size <= 0:
+            size = apk_path.stat().st_size
+    if sha:
+        payload["sha256"] = sha
+    if size > 0:
+        payload["sizeBytes"] = size
+    return payload
+
+
+@app.get("/app-update")
+def app_update(request: Request):
+    """Version metadata for the Android updater; safe to call without a session."""
+    return JSONResponse(
+        _app_update_payload(request),
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@app.get("/app-release.apk")
+def app_release_apk():
+    """Serve a configured local release artifact for self-hosted deployments."""
+    path = _update_apk_path()
+    if path is None:
+        raise HTTPException(status_code=404, detail="No app release artifact is configured.")
+    return FileResponse(
+        path,
+        media_type="application/vnd.android.package-archive",
+        filename=f"play-dot-{os.getenv('APP_UPDATE_LATEST_VERSION_NAME', '1.1.0').strip() or '1.1.0'}.apk",
+        headers={"Cache-Control": "no-cache", "X-Content-Type-Options": "nosniff"},
+    )
+
 
 # Enable CORS for local and deployed Wotchly frontends.
 # Render/Netlify deployments have historically used both variable names, so
@@ -247,6 +562,18 @@ def _positive_int_env(name: str, default: int) -> int:
 
 SESSION_TTL_SECONDS = _positive_int_env("SESSION_TTL_SECONDS", 1800)
 MAX_SESSIONS = _positive_int_env("MAX_SESSIONS", 500)
+
+# Compatibility transcoding is CPU-bound. Keep the default conservative so a
+# single Render instance does not spawn an unbounded number of ffmpeg workers.
+PLAY_COMPAT_MAX_CONCURRENT = _positive_int_env("PLAY_COMPAT_MAX_CONCURRENT", 1)
+PLAY_COMPAT_THREADS = _positive_int_env("PLAY_COMPAT_THREADS", 2)
+PLAY_COMPAT_MAX_SECONDS = _positive_int_env("PLAY_COMPAT_MAX_SECONDS", 4 * 3600)
+try:
+    FFPROBE_TIMEOUT_SECONDS = max(1.0, float(os.getenv("FFPROBE_TIMEOUT_SECONDS", "6")))
+except (TypeError, ValueError):
+    FFPROBE_TIMEOUT_SECONDS = 6.0
+_COMPAT_SLOTS = threading.BoundedSemaphore(PLAY_COMPAT_MAX_CONCURRENT)
+_COMPAT_QUALITIES = {"360p", "480p", "720p", "1080p", "2160p", "auto"}
 
 HISTORY_FILE = os.getenv("HISTORY_FILE", "local_history.json")
 _history_lock = threading.Lock()
@@ -1366,25 +1693,11 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
         streams = []
     logger.info("PLAY-INFO response: provider_code=%s streams=%s", primary_code, len(streams))
     
-    # OVERRIDE DUMMY URL WITH URLPREFIX DECODE
-    import base64
-    import re
-    for _st in streams:
-        _sc = _st.get("signCookie", "")
-        if "urlprefix=" in _sc:
-            match = re.search(r'urlprefix=([^:]+)', _sc)
-            if match:
-                b64_prefix = match.group(1)
-                b64_prefix += "=" * ((4 - len(b64_prefix) % 4) % 4)
-                try:
-                    prefix_url = base64.b64decode(b64_prefix).decode('utf-8')
-                    if prefix_url.startswith("http"):
-                        # MovieBox Dash/HLS streams use index.mpd for DASH streams
-                        _st["url"] = prefix_url + "index.mpd"
-                        logger.info("ANTI-PIRACY BYPASS: Decoded real URL -> %s", _safe_url_label(_st["url"]))
-                except Exception as e:
-                    logger.error(f"URLPREFIX decode error: {e}")
-    
+    # Provider anti-piracy / legacy-client detection is intentionally not
+    # bypassed here. If play-info returns a deprecation notice or dummy video,
+    # the supported path is the official current MovieBox client or another
+    # licensed source. Do not derive alternate CDN paths from signCookie.
+
     # Fallback to resourceDetectors inside movie/show detail if no streams found in play-info
     if not streams:
         logger.info(f"No streams from play-info. Checking resourceDetectors for subject {subject_id}...")
@@ -1433,14 +1746,9 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
     # do not identify the encoded video format.
     def stream_codec(st):
         for key in ("codec", "codecName", "videoCodec", "videoCodecName"):
-            value = st.get(key)
-            if not value:
-                continue
-            normalized = re.sub(r"[^a-z0-9]", "", str(value).lower())
-            if any(marker in normalized for marker in ("hevc", "h265", "hev1", "hvc1")):
-                return "hevc"
-            if any(marker in normalized for marker in ("h264", "avc", "avc1")):
-                return "h264"
+            normalized = _normalize_video_codec(st.get(key))
+            if normalized != "unknown":
+                return normalized
         return "unknown"
 
     def prioritize_h264(st):
@@ -1676,6 +1984,37 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
             raise HTTPException(status_code=502, detail="The provider rejected the stream session. Please retry.")
         raise HTTPException(status_code=404, detail="No streams found for this title.")
 
+    # The provider does not consistently declare a codec. Probe only when the
+    # provider metadata is silent so a normal AVC stream pays no extra latency.
+    declared_video_codec = stream_codec(working_stream)
+    declared_audio_raw = next(
+        (
+            working_stream.get(key)
+            for key in ("audioCodec", "audioCodecName", "audio_codec")
+            if working_stream.get(key)
+        ),
+        "",
+    )
+    declared_audio_codec = _normalize_audio_codec(declared_audio_raw)
+    media_probe = {}
+    source_type = _stream_type_from_url(working_stream.get("url", ""))
+    # Progressive MP4s are cheap to inspect and provider labels are often
+    # missing or wrong. Probe those even when a codec was declared so the
+    # response reports the real audio codec/dimensions. Manifests are only
+    # probed when the provider gave no codec at all.
+    if declared_video_codec == "unknown" or source_type == "mp4":
+        media_probe = _probe_media(
+            working_stream.get("url", ""),
+            working_cookie or "",
+        )
+        if media_probe.get("hasVideo") is False:
+            logger.warning("Selected source has no video track for %s", subject_id)
+            raise HTTPException(status_code=502, detail="The provider returned an audio-only source.")
+        if media_probe.get("videoCodec") and media_probe["videoCodec"] != "unknown":
+            declared_video_codec = media_probe["videoCodec"]
+        if media_probe.get("audioCodec") and media_probe["audioCodec"] != "unknown":
+            declared_audio_codec = media_probe["audioCodec"]
+
     # CALCULATE METADATA DURATION FOR FRONTEND OVERRIDE
     total_duration = 0
     source_method = "metadata"
@@ -1775,19 +2114,312 @@ def get_stream(subject_id: str, response: Response, season: int = 1, episode: in
     # PICK BEST SUBTITLE FOR MPV (Default to English if found)
     best_sub = next((s.get("url") for s in all_subtitles if s.get("lan") == "en" or "english" in (s.get("lanName") or "").lower()), None)
 
-    # DIRECT NATIVE LINK (No Proxy)
+    # DIRECT NATIVE LINK (No Proxy) plus safe capability metadata. The Android
+    # client uses this instead of guessing a container from a signed URL suffix.
+    stream_type = _stream_type_from_url(
+        working_stream.get("url", ""),
+        media_probe.get("container", ""),
+    )
+    quality_list = [
+        q for q in dict.fromkeys(
+            st.get("quality")
+            for st in streams
+            if isinstance(st, dict) and st.get("quality")
+        )
+    ]
+    selected_quality = str(working_stream.get("quality") or quality or "480p")
+    compat_query = (
+        f"season={season}&episode={episode}"
+        f"&quality={quote(selected_quality, safe='')}"
+    )
+    if resource_id:
+        compat_query += f"&resource_id={quote(str(resource_id), safe='')}"
+
     return {
         "url": working_stream.get("url", ""),
         "cookie": working_cookie,
         "duration": total_duration,
         "subtitles": all_subtitles,
         "subtitle_url": best_sub,
-        "isHls": working_stream.get("url", "").lower().endswith(".m3u8") or ".m3u8" in working_stream.get("url", "").lower(),
+        "isHls": stream_type == "hls",
+        "isDash": stream_type == "dash",
+        "mimeType": _mime_type_for_stream(stream_type),
+        "videoCodec": declared_video_codec,
+        "audioCodec": declared_audio_codec,
+        "videoWidth": int(media_probe.get("width") or 0),
+        "videoHeight": int(media_probe.get("height") or 0),
+        "isTranscoded": False,
+        "compatUrl": f"/play-compat/{quote(str(subject_id), safe='')}?{compat_query}",
+        "selectedQuality": selected_quality,
         "streamId": working_stream.get("id"),
-        "qualityList": list({st.get("quality") for st in streams if isinstance(st, dict) and st.get("quality")}),
+        "qualityList": quality_list,
         "episode": episode,
         "season": season
     }
+
+def _validate_compat_request(
+    subject_id: str,
+    season: int,
+    episode: int,
+    quality: str,
+    start_time: float,
+    resource_id: Optional[str],
+) -> tuple:
+    if not re.fullmatch(r"\d{1,32}", subject_id or ""):
+        raise HTTPException(status_code=400, detail="Invalid subject id.")
+    if not 0 <= season <= 1000:
+        raise HTTPException(status_code=400, detail="Invalid season.")
+    if not 0 <= episode <= 10000:
+        raise HTTPException(status_code=400, detail="Invalid episode.")
+    normalized_quality = (quality or "480p").strip().lower()
+    if normalized_quality not in _COMPAT_QUALITIES:
+        raise HTTPException(status_code=400, detail="Unsupported quality.")
+    if not 0 <= start_time <= 86400:
+        raise HTTPException(status_code=400, detail="Invalid start_time.")
+    if resource_id is not None and not re.fullmatch(r"\d{1,32}", str(resource_id)):
+        raise HTTPException(status_code=400, detail="Invalid resource id.")
+    return normalized_quality, ("720p" if normalized_quality == "auto" else normalized_quality)
+
+
+def _build_compat_ffmpeg_command(
+    source_url: str,
+    cookie: str,
+    start_time: float,
+    threads: int,
+) -> List[str]:
+    """Build an argv-only ffmpeg command; never use a shell or log its input URL."""
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return []
+    cmd = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel", "error",
+        "-nostdin",
+        "-rw_timeout", "15000000",
+    ]
+    if start_time > 0:
+        cmd.extend(["-ss", f"{start_time:.3f}"])
+    cmd.extend([
+        "-headers", _ffmpeg_http_headers(cookie),
+        "-i", source_url,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-map_metadata", "-1",
+        "-map_chapters", "-1",
+        "-vf", "scale=-2:480",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-tune", "zerolatency",
+        "-crf", "28",
+        "-maxrate", "1200k",
+        "-bufsize", "2400k",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "high",
+        "-level:v", "4.0",
+        "-g", "48",
+        "-keyint_min", "48",
+        "-sc_threshold", "0",
+        "-threads", str(max(1, threads)),
+        "-c:a", "aac",
+        "-b:a", "96k",
+        "-ac", "2",
+        "-ar", "48000",
+        "-avoid_negative_ts", "make_zero",
+        "-movflags", "+frag_keyframe+empty_moov+default_base_moof",
+        "-f", "mp4",
+        "pipe:1",
+    ])
+    return cmd
+
+
+def _stop_compat_process(process) -> None:
+    if process is None:
+        return
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    except Exception:
+        pass
+
+
+@app.get("/play-compat/{subject_id}")
+async def play_compat(
+    request: Request,
+    subject_id: str,
+    season: int = 1,
+    episode: int = 1,
+    quality: str = "480p",
+    start_time: float = 0.0,
+    resource_id: Optional[str] = None,
+    session_id: Optional[str] = Cookie(None),
+):
+    """Stream a device-compatible H.264/AAC rendition of a provider source.
+
+    This is the fallback for HEVC-only titles and for devices whose advertised
+    HEVC decoder never emits a frame. It starts on demand, is bounded by a
+    process slot, and is never used for ordinary AVC playback.
+    """
+    _, provider_quality = _validate_compat_request(
+        subject_id, season, episode, quality, start_time, resource_id,
+    )
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(
+            status_code=503,
+            detail="Compatibility transcoding is unavailable on this server.",
+        )
+    if not _COMPAT_SLOTS.acquire(blocking=False):
+        raise HTTPException(
+            status_code=429,
+            detail="Compatibility transcoding is busy. Please retry in a moment.",
+        )
+
+    process = None
+    first_chunk = b""
+    try:
+        # Provider CDN mirrors can rotate between requests, and a HEAD 200 does
+        # not guarantee that a specific edge will serve media bytes to ffmpeg.
+        # Retry once with a fresh resolution before reporting a compatibility
+        # failure to the client.
+        for attempt in range(2):
+            resolved = await run_in_threadpool(
+                get_stream,
+                subject_id,
+                Response(),
+                season=season,
+                episode=episode,
+                quality=provider_quality,
+                resource_id=resource_id,
+                session_id=session_id,
+            )
+            if not isinstance(resolved, dict):
+                raise HTTPException(status_code=502, detail="The stream resolver returned invalid data.")
+            source_url = resolved.get("url")
+            if not source_url:
+                raise HTTPException(status_code=502, detail="No playable source is available for compatibility mode.")
+            try:
+                _validate_public_http_url(source_url, label="media")
+            except HTTPException:
+                logger.warning("PLAY-COMPAT rejected a non-public source for %s", subject_id)
+                raise HTTPException(status_code=502, detail="The media source is not publicly reachable.")
+
+            cmd = _build_compat_ffmpeg_command(
+                source_url,
+                resolved.get("cookie") or "",
+                start_time,
+                PLAY_COMPAT_THREADS,
+            )
+            if not cmd:
+                raise HTTPException(status_code=503, detail="FFmpeg is unavailable.")
+
+            process = subprocess.Popen(
+                cmd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                bufsize=0,
+            )
+            if process.stdout is None:
+                raise HTTPException(status_code=502, detail="FFmpeg could not start.")
+
+            # Fail before committing response headers if ffmpeg cannot produce
+            # output; this makes input/configuration errors visible instead of
+            # returning a permanently empty 200 response.
+            try:
+                first_chunk = await asyncio.wait_for(
+                    asyncio.to_thread(process.stdout.read, 64 * 1024),
+                    timeout=15.0,
+                )
+            except asyncio.TimeoutError:
+                first_chunk = b""
+                logger.warning(
+                    "PLAY-COMPAT attempt %s timed out for %s",
+                    attempt + 1,
+                    subject_id,
+                )
+            if not first_chunk:
+                _stop_compat_process(process)
+                process = None
+                if attempt == 0:
+                    await asyncio.sleep(0.5)
+                    continue
+                raise HTTPException(
+                    status_code=502,
+                    detail="Could not transcode this source for compatibility playback.",
+                )
+
+            logger.info(
+                "PLAY-COMPAT started id=%s quality=%s start=%.1fs",
+                subject_id,
+                provider_quality,
+                start_time,
+            )
+            break
+    except BaseException:
+        _stop_compat_process(process)
+        _COMPAT_SLOTS.release()
+        raise
+
+    async def body():
+        try:
+            chunk = first_chunk
+            started = time.monotonic()
+            while chunk:
+                if await request.is_disconnected():
+                    break
+                yield chunk
+                if time.monotonic() - started > PLAY_COMPAT_MAX_SECONDS:
+                    logger.warning("PLAY-COMPAT exceeded the maximum duration for %s", subject_id)
+                    break
+                try:
+                    chunk = await asyncio.to_thread(process.stdout.read, 256 * 1024)
+                except (OSError, ValueError):
+                    break
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            _stop_compat_process(process)
+            _COMPAT_SLOTS.release()
+            logger.info("PLAY-COMPAT closed id=%s rc=%s", subject_id, process.returncode)
+
+    return StreamingResponse(
+        body(),
+        media_type="video/mp4",
+        headers={
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "none",
+            "X-PlayDot-Transcoded": "1",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@app.head("/play-compat/{subject_id}")
+async def play_compat_head(
+    subject_id: str,
+    season: int = 1,
+    episode: int = 1,
+    quality: str = "480p",
+    start_time: float = 0.0,
+    resource_id: Optional[str] = None,
+):
+    _validate_compat_request(subject_id, season, episode, quality, start_time, resource_id)
+    if not shutil.which("ffmpeg"):
+        raise HTTPException(status_code=503, detail="Compatibility transcoding is unavailable on this server.")
+    return Response(
+        headers={
+            "Content-Type": "video/mp4",
+            "Cache-Control": "no-store",
+            "Accept-Ranges": "none",
+            "X-PlayDot-Transcoded": "1",
+        },
+    )
+
 
 import os
 

@@ -2,6 +2,7 @@
 
 Native Kotlin + Jetpack Compose client for the `moviebox-internal-api` backend.
 Display name: **PLAY DOT**. Package ID: `com.streambox.mobile` (kept stable for updates).
+Current release: **1.1.0** (versionCode `3`).
 
 ## Screens
 
@@ -20,6 +21,38 @@ controls. Settings are built from supported Media3 tracks: adaptive video tracks
 can be selected manually or returned to Auto, audio tracks use actual language
 metadata, and CC lists embedded or backend-provided subtitles with an Off option.
 Fixed-quality sources do not expose invented quality choices.
+
+> **Provider notice:** Some titles play a 22.7-second “VERSION LEGACY /
+> SUPPORT ENDING”/“This version will be discontinued soon” placeholder served
+> by the third-party provider. It is inside the video stream, not Play Dot UI,
+> signing, or update state. It cannot be removed by updating this app; use the
+> official current provider app or a licensed source. No anti-piracy bypass is
+> implemented. See [`../docs/UPDATE_SYSTEM.md`](../docs/UPDATE_SYSTEM.md).
+
+## In-app updates
+
+The app checks the backend’s `GET /app-update` after the first frame and never
+blocks launch:
+
+- Optional updates can be dismissed with **Later**; the skipped version is
+  stored in DataStore and hidden on later launches. Mandatory updates (installed
+  version below `minimumSupportedVersionCode`) have no dismiss path.
+- The downloaded APK is limited to 250 MiB, must match `sizeBytes`/`sha256` when
+  published, must have package `com.streambox.mobile` and an acceptable
+  versionCode, and must be signed by the **installed app’s current certificate**.
+- Verification failure deletes the APK and shows Retry; the installer is never
+  opened.
+- Installation always uses the Android system installer (with the
+  `REQUEST_INSTALL_PACKAGES` user grant and a cache-only FileProvider). There is
+  no silent install, no Play In-App Updates, and no signature-check weakening.
+- Release builds require HTTPS. Debug builds may use the emulator/loopback
+  cleartext test origin; the debug network-security config independently
+  restricts it.
+- An old backend (`404`) or intentionally disabled endpoint (`503`) is treated
+  as “no update” silently.
+
+See [`../docs/UPDATE_SYSTEM.md`](../docs/UPDATE_SYSTEM.md) for the schema,
+`APP_UPDATE_*` variables, APK hosting, deployment, and actual test results.
 
 ## Build
 
@@ -96,11 +129,23 @@ adb install -r app/build/outputs/apk/release/app-release.apk
 - A sideloaded APK may be scanned by Play Protect. Use the signed release build
   for normal use; do not disable Play Protect or device security to force an
   install.
+- In-app updates require the published APK to have the same application ID,
+  the existing release signer, and a versionCode at or above the advertised
+  `latestVersionCode`. A different signer is rejected before the installer is
+  opened. The app uses the cached APK only after SHA/size (when configured),
+  package, version, and certificate checks pass.
+- The update endpoint must publish `sha256` and `sizeBytes` for reliable
+  production delivery. The backend can compute both when it serves a local
+  artifact; external hosting must set them explicitly.
 
 ## Networking / security
 
-- Manifest permission: `INTERNET` only. `ACCESS_NETWORK_STATE` is pulled in
-  transitively by AndroidX/Coil and is a normal permission.
+- Manifest permissions: `INTERNET` and `REQUEST_INSTALL_PACKAGES`.
+  `ACCESS_NETWORK_STATE` is pulled in transitively by AndroidX Media3 and is a
+  normal permission.
+- A non-exported cache-only `FileProvider` shares only the verified update APK
+  with the system package installer, for the duration of one
+  `FLAG_GRANT_READ_URI_PERMISSION` intent.
 - No app-authored services, background receivers, WebView, analytics, or
   dynamic code loading.
 - `network_security_config.xml` permits cleartext HTTP only for the standard
@@ -134,12 +179,14 @@ app/src/main/java/com/streambox/mobile/
 ├── data/
 │   ├── remote/                 # Retrofit service + DTOs
 │   ├── repo/ContentRepository  # Result wrappers + error taxonomy
-│   └── local/                  # DataStore watchlist/progress, resume policy
+│   ├── local/                  # DataStore watchlist/progress, resume policy
+│   └── update/                 # update policy/repository/DataStore/download/verifier/installer
 ├── ui/
 │   ├── theme/                  # dark-only brand theme, type, shapes
 │   ├── components/             # cards, rails, skeletons, error/empty states
 │   ├── screens/{home,search,detail,watchlist,splash}/
 │   ├── player/                 # PlayerScreen + PlayerViewModel (Media3)
+│   ├── update/                 # UpdateViewModel + Compose dialog
 │   └── navigation/StreamBoxNavHost.kt
 └── MainActivity.kt, StreamBoxApplication.kt
 ```

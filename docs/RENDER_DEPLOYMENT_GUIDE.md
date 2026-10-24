@@ -1,13 +1,14 @@
 # Render Deployment Guide
 
-Status as of **2026-10-21**: this repository contains a Docker-based Render
-Blueprint and hardened backend configuration, but **no Render service was
-created and no public HTTPS URL exists**. Do not treat any value in this guide
-as an already-live endpoint. Deployment is an explicit owner action.
+Status as of **2026-10-22**: the Android release targets the existing public
+origin `https://play-dot.onrender.com/`, but that live deployment predates the
+current backend tree and does **not** expose `/app-update` or a hosted update
+APK. Creating/replacing the service from this repository is an explicit owner
+action. Do not treat any update endpoint in this guide as already live.
 
 The Android app must be rebuilt with the real HTTPS origin after the service is
-created. A release APK built with a local URL cannot be used as the production
-artifact.
+created or redeployed. A release APK built with a local URL cannot be used as
+the production artifact.
 
 ## 1. What is configured
 
@@ -132,9 +133,24 @@ Do not set `PORT` manually; Render supplies it. `HOST` defaults to `0.0.0.0`.
 | `FRONTEND_URL` | No | Backwards-compatible alias for CORS; not needed for Android. |
 | `MAX_SUBTITLE_PROXY_BYTES` | No | Defaults to 10 MiB. |
 | `HISTORY_FILE` | No | Do not expect durable history on Render's ephemeral disk. |
+| `APP_UPDATE_LATEST_VERSION_CODE` | For updates | Numeric versionCode advertised by `/app-update`, e.g. `3`. |
+| `APP_UPDATE_LATEST_VERSION_NAME` | For updates | Display version, e.g. `1.1.0`. |
+| `APP_UPDATE_MINIMUM_VERSION_CODE` | For updates | Builds below this are mandatory, e.g. `1`. |
+| `APP_UPDATE_RELEASE_NOTES` | For updates | Plain-text dialog notes. |
+| `APP_UPDATE_APK_URL` | For updates | Public **HTTPS** APK URL; the backend rejects public cleartext URLs. |
+| `APP_UPDATE_APK_PATH` | Optional | Backend-local APK path; `/app-release.apk` serves it if configured. |
+| `APP_UPDATE_APK_SHA256` | Recommended | 64-hex SHA-256; required for external hosting. |
+| `APP_UPDATE_APK_SIZE_BYTES` | Recommended | Exact artifact size; required for external hosting. |
+| `APP_UPDATE_PACKAGE_NAME` | Recommended | `com.streambox.mobile`. |
 
 Native Android HTTP is not subject to CORS. Configure `CORS_ORIGINS` only for a
 browser dashboard, and list exact HTTPS origins rather than `*` when possible.
+
+Render's disk is ephemeral. The recommended production pattern is to publish
+the signed APK to an external HTTPS artifact (object storage or GitHub Releases
+asset) and set `APP_UPDATE_APK_URL`, `APP_UPDATE_APK_SHA256`, and
+`APP_UPDATE_APK_SIZE_BYTES`. Do not point Android at a URL that requires a
+browser login or short-lived signed query.
 
 ## 6. Verify the deployment
 
@@ -145,6 +161,7 @@ Use the actual hostname shown by Render in place of
 curl -sS -i https://<service-name>.onrender.com/health
 curl -sS https://<service-name>.onrender.com/trending
 curl -sS 'https://<service-name>.onrender.com/search?q=Black%20Clover'
+curl -sS -i https://<service-name>.onrender.com/app-update
 ```
 
 Expected readiness response:
@@ -166,6 +183,13 @@ Checks:
   `ENABLE_EXTERNAL_PLAYER=false`.
 - `/sub-proxy?u=http://127.0.0.1/...` should return `400`; private/loopback
   targets are rejected.
+- `/app-update` returns `200` only when a valid update artifact is configured.
+  `503` means update metadata/artifact is intentionally absent or invalid; it is
+  not a health failure. The release client silently treats `503`/`404` as “no
+  update”.
+- If `APP_UPDATE_APK_PATH` is used, download `/app-release.apk` and compare its
+  SHA-256/size with the `/app-update` payload. If an external URL is used,
+  download that exact URL and compare. Never publish a debug/unsigned APK.
 - Check Render logs for startup line `Backend configuration validated.` and for
   provider failures. Signed media URLs and credential values should not appear
   in current logs.
@@ -227,11 +251,42 @@ android-app/app/build/outputs/apk/release/app-release.apk
 Validate the signer and record the SHA-256:
 
 ```bash
-export PATH="$ANDROID_HOME/build-tools/36.0.0:$PATH"
+export PATH="$ANDROID_HOME/build-tools/35.0.0:$PATH"
 apksigner verify --verbose --print-certs \
   android-app/app/build/outputs/apk/release/app-release.apk
 sha256sum android-app/app/build/outputs/apk/release/app-release.apk
 ```
+
+The current release is versionCode `3` / versionName `1.1.0`, signed with the
+existing Play Dot release key. The application ID must remain
+`com.streambox.mobile`. Do not rebuild the APK with a different signer if you
+expect in-place updates.
+
+### Publish the update artifact
+
+Choose one:
+
+- **External HTTPS (recommended):** upload the signed APK to object storage or a
+  GitHub Releases asset, then set `APP_UPDATE_APK_URL`,
+  `APP_UPDATE_APK_SHA256`, and `APP_UPDATE_APK_SIZE_BYTES` on Render. Verify the
+  URL downloads without login/cookies.
+- **Backend-hosted:** set `APP_UPDATE_APK_PATH` to a path that exists inside the
+  Render container (for example, copied in during the build) and set
+  `APP_UPDATE_APK_URL=https://<service-name>.onrender.com/app-release.apk`.
+  Do not rely on a local file surviving a restart; Render's disk is ephemeral.
+
+Then deploy/restart and verify:
+
+```bash
+curl -sS https://<service-name>.onrender.com/app-update
+curl -sS -o /tmp/playdot-latest.apk \
+  https://<service-name>.onrender.com/app-release.apk
+sha256sum /tmp/playdot-latest.apk
+```
+
+The metadata's `sha256`/`sizeBytes` must match the downloaded file. If the
+endpoint returns `503`, update configuration is incomplete; this is safe and
+non-intrusive but means no one can update.
 
 Install on a test device only after the release URL is live:
 
@@ -259,6 +314,12 @@ repeat these checks against the HTTPS build.
 - **External player disabled**: `/launch-player` returns `501` by configuration.
 - **Provider dependency**: upstream rate limits, expiring guest tokens, catalogue
   changes, and regional 404s remain outside this repository's control.
+- **Provider playback notice**: the provider serves a legacy/anti-piracy dummy
+  video to this unsupported client. It is not an app-update bug; see
+  [`UPDATE_SYSTEM.md`](UPDATE_SYSTEM.md). No bypass is implemented.
+- **Updater artifact durability**: `/app-release.apk` serves a configured local
+  path; Render's disk is ephemeral. Use an external HTTPS artifact for
+  production or copy the APK in during the build.
 - **TLS**: verification is enabled for stream probes and subtitle proxying. Do
   not add a blanket `verify=False` fallback for a problematic CDN; fix the CDN
   or isolate the workaround behind an explicit, reviewed setting.
@@ -285,7 +346,11 @@ session on its next request.
 | `/health` 200 but content 502 | Provider outage/rate limit, expired credentials, wrong region/catalogue. Check redacted logs. |
 | Android says "Can't reach the server" | APK was built with the wrong base URL, missing trailing slash, wrong scheme, or service is asleep. |
 | Android can load but playback 404 | Provider has no stream for that title/episode; try a known-good ID. |
+| Android plays a “VERSION LEGACY” notice | Third-party provider dummy video for an unsupported client; an app update cannot fix it. Use the official/current app or a licensed source; do not bypass. |
 | `/download` returns 503 | HLS/DASH on a host without FFmpeg; not a client bug. |
+| `/app-update` returns 404 | This backend deployment predates the update route; deploy the current tree. |
+| `/app-update` returns 503 | Set a valid HTTPS `APP_UPDATE_APK_URL` or a readable `APP_UPDATE_APK_PATH`; check version/minimum values. |
+| Update downloads but says “could not be verified” | APK package/signer/version does not match the installed build; publish the same-key release APK and correct `latestVersionCode`. |
 | Render rejects Blueprint | `autoDeployTrigger`, `plan`, or `runtime` schema may have changed; compare with Render's current Blueprint reference before editing secrets. |
 
 Do not commit `.env`, keystore files, APKs, or Render credentials. Run

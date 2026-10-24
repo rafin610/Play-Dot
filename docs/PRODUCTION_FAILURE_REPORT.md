@@ -1,507 +1,336 @@
 # Play Dot — Production Failure Investigation Report
 
 **Date:** 2026-10-22
-**Scope:** release APK, Render backend, MovieBox integration, Android ↔ backend data flow
+**Scope:** signed release APK, Render backend, MovieBox integration, Android playback
 **Production origin:** `https://play-dot.onrender.com/`
-**Updated status:** **H.264 sample rendering verified on a Pixel 7 AVD; current
-MovieBox provider playback remains blocked by a live HTTP 429 response** (see
-§12)
+**Verification device:** Pixel 7 Android emulator (no physical phone available)
+**Current status:** native production playback now renders a video frame in the
+signed release APK on the emulator. Real-device verification is still
+outstanding. A separate provider-side “VERSION LEGACY” placeholder video can
+replace the requested episode; it is not an app rendering failure. See
+[`UPDATE_SYSTEM.md`](UPDATE_SYSTEM.md) for the update system and provider
+banner audit.
 
 ---
 
-## 1. Confirmed root cause
+## 1. Summary
 
-The release APK that was installed on the phone was built with the **emulator-only
-backend URL**:
+Two independent release defects were found.
 
-```text
-http://10.0.2.2:8000/
-```
+1. An earlier release APK was built against the emulator-only backend
+   `http://10.0.2.2:8000/`. That release could not reach the production API from
+   a real phone. The build now requires an explicit public HTTPS origin and the
+   current APK embeds `https://play-dot.onrender.com/`.
+2. Black video on the emulator was **not** an HEVC/decoder failure. The
+   `PlayerView` was never given the ExoPlayer instance after the player was
+   created. `AndroidView`'s `update` block did not rerun because its captured
+   inputs appeared unchanged, so `PlayerView.player` stayed `null`. ExoPlayer
+   initialized its video/audio decoders and advanced the timeline, but no video
+   surface was attached to the player.
 
-`10.0.2.2` is a special alias that only exists inside the Android emulator, where
-it maps to the host machine's loopback interface. On a physical phone it is just
-an ordinary private IP address with no Play Dot server listening on port 8000.
-Every API call made by the app therefore failed before it could reach the backend:
+The fix binds each player identity to a fresh `PlayerView` inside
+`key(currentPlayer)`. Native HEVC and H.264 playback both render first frames
+after this fix, and the signed production release renders the previously failing
+HEVC title.
 
-- Home (`/trending`, `/home`) → no content, error state
-- Search (`/search`) → no results
-- Detail (`/detail`, `/episodes`) → no data
-- Playback (`/stream`, `/subtitles`) → no stream
+A later provider response can serve a 22.7-second “VERSION LEGACY” placeholder
+instead of the requested episode. That is provider media content for an
+unsupported/legacy client, not an Android rendering, signing, or UI defect.
+Updating Play Dot cannot legitimately remove it; the supported path is the
+official current provider app or a licensed source. No anti-piracy bypass is
+implemented.
 
-The failure is in the APK's build configuration, not in the Render backend, the
-MovieBox provider, or the JSON contract.
+---
 
-### Why the APK contained the emulator URL
+## 2. Exact failing media and failure layer
 
-The Gradle build resolves the base URL as follows (before the fix):
+| Item | Value |
+|---|---|
+| Title used for the failing case | `Epic - First Semester` |
+| Native video codec | HEVC Main, `hev1` / `hvc1.1.6.L90.90` |
+| Native video | 850x480, yuv420p, 24 fps |
+| Native audio | AAC HE-AAC 5.1, 48 kHz (`mp4a.40.2` in the selected track) |
+| Container | MP4 |
+| Emulator decoder | `c2.goldfish.hevc.decoder` |
+| Failure layer | Android view/player binding: no `PlayerView` surface attached |
+| Not the failure layer | Codec support, CDN, HTTP/auth, backend JSON, audio decoder, `SurfaceView` vs `TextureView` |
+
+Evidence that the media and player were healthy even while the screen was black:
+
+- ExoPlayer selected a supported HEVC video track.
+- `Video decoder initialized: c2.goldfish.hevc.decoder` appeared.
+- Video and audio input formats were logged.
+- Playback position advanced and audio decoded.
+- `PlayerView.player` was still null; the view had no player to attach to a
+  surface. The `AndroidView` update callback had run only at first composition,
+  when the player did not yet exist.
+
+Both HEVC and H.264 titles were black before the binding fix. After the fix, both
+codecs render. HEVC was therefore a red herring.
+
+---
+
+## 3. Android fix
+
+### 3.1 Player/View binding
+
+`PlayerScreen` now keys the Android view by the actual player identity and
+captures that player in the view factory/update block:
 
 ```kotlin
-val streamboxBaseUrl = providers.gradleProperty("streambox.baseUrl").orNull
-    ?: "http://10.0.2.2:8000/"
-buildConfigField("String", "STREAM_BASE_URL", "\"$streamboxBaseUrl\"")
-```
-
-`android-app/gradle.properties` does **not** define `streambox.baseUrl`. The
-release APK was produced without passing `-Pstreambox.baseUrl`, so the fallback
-value — the emulator host — was compiled into `BuildConfig.STREAM_BASE_URL`.
-
-### Evidence from the original APK
-
-The original `app-release.apk` (built 2026-10-21 19:48) was inspected before the
-rebuild:
-
-- `classes3.dex` contained both `STREAM_BASE_URL` and `http://10.0.2.2:8000/`
-- No `onrender.com` host was present anywhere in the dex files
-- The APK was correctly signed (`CN=Play Dot`), so signing was never the problem
-
-This is direct evidence of the embedded value; the phone-level exception text
-itself was not captured because no phone was available for `adb` access.
-
-### The cleartext nuance
-
-The network security config allows cleartext only for `10.0.2.2`, `localhost`,
-and `127.0.0.1`. The bad APK's host was on that allowlist, so cleartext policy
-did not stop the request. The request still failed because **no server exists at
-`10.0.2.2:8000` on a physical phone**. A developer who tried to work around this
-by building with a LAN IP would then hit the cleartext block, because the LAN IP
-is not on the allowlist.
-
----
-
-## 2. Evidence that the backend and provider are healthy
-
-All checks below were executed against the real production service, not mocks.
-The service responded with real catalog data.
-
-### Health
-
-`GET https://play-dot.onrender.com/health` → **HTTP 200**
-
-```json
-{
-  "status": "ok",
-  "service": "moviebox-internal-api",
-  "version": "1.0.0",
-  "guest_token": {
-    "expires_at": "2027-01-19T13:17:26Z",
-    "expires_in_days": 89.8,
-    "expired": false
-  }
+key(currentPlayer) {
+    AndroidView(
+        factory = { context ->
+            LayoutInflater.from(context)
+                .inflate(R.layout.player_view, null, false) as PlayerView
+        },
+        update = { view ->
+            view.player = currentPlayer
+        },
+        ...
+    )
 }
 ```
 
-The first request took **22.6 s** (Render cold start); subsequent requests took
-2.5–9.2 s. The guest token was valid with ~90 days remaining, so token expiry was
-not the cause.
+`key(currentPlayer)` forces a fresh `PlayerView` whenever the player is created
+or replaced. The `update` block then binds that exact player. The view is
+released and detached correctly when the screen leaves composition or the player
+is replaced.
 
-### Endpoints used by the Android app
+### 3.2 Compatibility fallback
 
-| Endpoint | Result | Shape observed |
-|---|---|---|
-| `GET /trending` | 200, ~5 KB | `{code:0, data:[9 items]}` |
-| `GET /home` | 200, ~207 KB | `{code:0, data:{list:[20 sections]}}` |
-| `GET /search?q=Black%20Clover` | 200, ~5.7 KB | `{code:0, data:{items:[10]}}` |
-| `GET /rankings` | 200, ~5.6 KB | `{code:0, data:[1 section]}` |
-| `GET /detail/1131798723912254248` | 200, ~1.8 KB | `code:0`, real title/cast/languages |
-| `GET /episodes/1131798723912254248` | 200 | 1 season, 4 episodes |
-| `GET /stream/1131798723912254248?season=1&episode=1&quality=720p` | 200 | `url`, `duration`, `isHls:false`, subtitles |
-| `GET /subtitles/...` | 200 | subtitle list |
-| Provider CDN `HEAD` + range `GET` | 200 / 206 | `video/mp4`, ranged requests supported |
-| Subtitle CDN `GET` | 200 | `application/x-subrip` |
+The backend can expose a native stream plus an optional, relative
+`compatUrl` for an on-demand H.264/AAC 480p rendition. The Android client:
 
-The live JSON types match the Android DTOs (`subjectId`/`id` strings, numeric
-`subjectType`, nullable `runtime`, etc.). No contract mismatch was found.
+- keeps the native stream when the device advertises a usable decoder;
+- preempts to `compatUrl` only for HEVC when no HEVC decoder exists;
+- starts a 15-second first-frame watchdog after `STATE_READY`; if no frame is
+  rendered, it switches the **same ExoPlayer** to the compatibility media source
+  (`reusePlayer = true`) rather than releasing/recreating the player;
+- reports the actual failure layer (resolver, network, decoder, surface, or
+  first-frame timeout) without logging signed URLs, cookies, or tokens.
 
----
-
-## 3. Fixes applied
-
-### 3.1 Release builds can no longer ship the emulator URL
-
-`android-app/app/build.gradle.kts` now:
-
-- Reads the backend origin from `-Pstreambox.baseUrl` **or** the
-  `STREAM_BOX_BASE_URL` environment variable.
-- Normalizes a missing trailing slash (Retrofit requires one).
-- Adds a `checkReleaseBaseUrl` verification task that **fails the release build**
-  when:
-  - no explicit origin is supplied,
-  - the origin is not `https://`,
-  - the host is `localhost`, `127.0.0.1`, `0.0.0.0`, `10.0.2.2`, or `*.local`.
-- Makes `assembleRelease`, `bundleRelease`, and `packageRelease` depend on that
-  check.
-
-Verified failures:
-
-```text
-> Task :app:checkReleaseBaseUrl FAILED
-Release builds require -Pstreambox.baseUrl=https://<service>.onrender.com/
-(or the STREAM_BOX_BASE_URL environment variable).
-```
-
-```text
-> Task :app:checkReleaseBaseUrl FAILED
-Release builds require an HTTPS backend URL, got: http://10.0.2.2:8000/
-```
-
-### 3.2 Startup diagnostic
-
-`StreamBoxApplication.kt` now logs the public backend origin at startup (never a
-secret) and warns if it is not HTTPS:
-
-```text
-I/PlayDot: Backend base URL: https://play-dot.onrender.com/ (debug=false)
-```
-
-### 3.3 Rebuilt and signed release APK
-
-Built with:
-
-```bash
-./gradlew :app:assembleRelease \
-  -Pstreambox.baseUrl=https://play-dot.onrender.com/
-```
-
-Resulting `BuildConfig`:
-
-```java
-public static final boolean DEBUG = false;
-public static final String STREAM_BASE_URL = "https://play-dot.onrender.com/";
-```
-
-Dex inspection confirms the production host is present and
-`http://10.0.2.2:8000/` is absent.
-
-### 3.4 Documentation
-
-`android-app/README.md` and `docs/RENDER_DEPLOYMENT_GUIDE.md` now show the
-production build command, the required explicit origin, the guard behavior, and
-the verified deployment URL.
+The compatibility endpoint is bounded: one concurrent transcode by default,
+`429` when busy, `503` when FFmpeg is absent, `400` for invalid request values,
+`502` for upstream/transcoder failure, SSRF validation of the resolved source,
+and process cleanup on disconnect/timeout.
 
 ---
 
-## 4. Verification performed
+## 4. Production backend status
 
-### 4.1 Automated tests
+Checked on 2026-10-22:
 
-| Check | Command | Result |
-|---|---|---|
-| Backend unit/contract tests | `.venv/bin/python -m unittest discover -s tests -v` | **30 passed, 0 failed** (0.313 s) |
-| Android unit tests | `./gradlew :app:testDebugUnitTest --rerun-tasks --offline` | **15 passed, 0 skipped, 0 failures, 0 errors** |
-| Release build guard (missing property) | `./gradlew :app:assembleRelease --offline` | failed with explicit message (expected) |
-| Release build guard (HTTP loopback) | `./gradlew :app:assembleRelease -Pstreambox.baseUrl=http://10.0.2.2:8000/` | failed with “require an HTTPS” (expected) |
-| Release build (production) | `./gradlew :app:assembleRelease -Pstreambox.baseUrl=https://play-dot.onrender.com --offline` | **BUILD SUCCESSFUL** |
+| Check | Result |
+|---|---|
+| `GET /health` | `200` |
+| `GET /stream/...` | `200`, old response shape: no `compatUrl`, `mimeType`, or codec dimensions |
+| `HEAD /play-compat/...` | `404` |
 
-These backend tests are offline contract tests with a fake provider session; the
-live endpoint calls in §2 are the real production integration checks.
+The deployed Render backend is **older than this working tree**. Its `/stream`
+does not advertise the compatibility URL, and `/play-compat` is not deployed.
+The current release therefore plays the native provider stream directly. On this
+emulator the native HEVC title renders. A real device without a usable HEVC
+decoder will not receive the compatibility fallback until the newer backend and
+FFmpeg are deployed. No Render dashboard or deployment access was available.
 
-### 4.2 APK artifact
+---
 
-| Property | Value |
+## 5. Verification performed
+
+### 5.1 Native HEVC, debug build
+
+- Title: `Epic - First Semester`
+- First video frame: `13:59:03.056`
+- Decoder: `c2.goldfish.hevc.decoder`
+- Video: 850x480
+- Rendered screenshot: real movie frame visible; black-video symptom gone.
+
+### 5.2 Native H.264, debug build
+
+- Title: `King Azalaar 1`
+- First video frame: `13:55:42.553`
+- Codec: H.264 High `avc1.64001F`, 960x538
+- Result: rendered frame, confirming the fix was not codec-specific.
+
+### 5.3 Compatibility path, debug build
+
+- Compatibility output: H.264 Constrained Baseline `avc1.42C028`, 850x480,
+  AAC stereo 48 kHz.
+- A preempted compatibility run rendered a first frame after the binding fix.
+- The same-player fallback was exercised by temporarily forcing the app to
+  switch from native HEVC to compatibility after two seconds. It called
+  `setMediaSource(..., reusePlayer = true)` on the already-bound ExoPlayer; the
+  H.264 decoder initialized and the first frame rendered at `15:51:38.617`
+  (`c2.goldfish.h264.decoder`, 850x480). No `PlayerView` rebind was needed.
+- Backend FFmpeg output was also probed directly and rendered by a Media3
+  instrumentation test during development.
+- The production watchdog was not triggered during normal playback because
+  native HEVC now renders immediately; the forced test verifies the same code
+  path without shipping a test flag.
+
+### 5.4 Signed production release, emulator
+
+- Backend log: `Backend base URL: https://play-dot.onrender.com/ (debug=false)`
+- Title: `Epic - First Semester` (production API)
+- First video frame: `15:42:35.613`
+- Decoder: `c2.goldfish.hevc.decoder`
+- Video: 850x480
+- Screenshot: real rendered frame from the production signed APK.
+
+### 5.5 Interaction matrix (debug build, same player code)
+
+| Test | Result |
+|---|---|
+| Portrait → landscape | Passed; frame remained rendered and controls usable |
+| Landscape → portrait | Passed |
+| Pause / resume | Passed; frame held and resumed |
+| Seek forward/back | Passed; new position rendered |
+| Background → foreground | Passed; playback resumed and frame advanced |
+| 12-second network interruption | Passed from buffered media; frame continued, then playback continued after network restoration |
+| Lower-quality compatibility stream | Passed at 480p H.264/AAC |
+| Public H.264 HLS | Media3 instrumentation test passed |
+| DASH | Not tested; no DASH source was available in this app/backend |
+| Full reconnect/error recovery | Not forced; the 12-second loss was absorbed by the buffer, so the explicit error/retry path was not exercised |
+
+### 5.6 Automated tests
+
+- Backend: `43` Python unittest tests pass, including `/stream` metadata,
+  `/play-compat` HEAD/validation, private-source rejection, busy-slot behavior,
+  FFmpeg command bounds, contract/SSRF checks, and `/app-update` contract tests.
+- Android unit tests: `26` pass, including new DTO coverage and 10 update-policy
+  tests.
+- Android instrumentation HLS test passes.
+
+---
+
+## 6. APK artifact
+
+| Field | Value |
 |---|---|
 | Path | `android-app/app/build/outputs/apk/release/app-release.apk` |
-| Version | `versionCode 2`, `versionName 1.0.0-playdot` |
-| minSdk / targetSdk | 26 / 35 |
-| SHA-256 | `70264d5e659591d5dda6c8202b23b07bd1f967b6fb02c56c114891f4d98fb407` |
+| Size | 16 MB |
+| Version | versionCode `3`, versionName `1.1.0` |
+| Embedded backend | `https://play-dot.onrender.com/` |
+| Release network config | `cleartextTrafficPermitted="false"`; no local domain exceptions |
+| SHA-256 | `166a92061a99af55345cb24b0b488be251298d880467a03bdc733539a619cbc8` |
+| Signature | APK Signature Scheme v2 |
 | Signer | `CN=Play Dot, OU=Mobile, O=Play Dot, L=Dhaka, C=BD` |
-| Signer SHA-256 | `26464e001c365a0142c80882665ebdefadfa4b9cdbef2b837f4fdd9d2f5bcd3d` |
-| Embedded URL | `https://play-dot.onrender.com/` |
-| Emulator URL in dex | absent |
+| Certificate SHA-256 | `26464e001c365a0142c80882665ebdefadfa4b9cdbef2b837f4fdd9d2f5bcd3d` |
+| Key | RSA 4096-bit |
 
-### 4.3 Real device-emulator run (release APK)
-
-Installed with `adb -s emulator-5556 install` (Pixel_7 AVD, Android 17) and
-launched normally. `emulator-5554` was an unrelated pre-existing AVD and was not
-modified.
-
-Confirmed:
-
-- Logcat: `Backend base URL: https://play-dot.onrender.com/ (debug=false)`
-- Home rendered real production content: hero **“Black Clover [Hindi]”**,
-  “Trending Now”, “IN Banner”, real posters (Coil image loading).
-- Search for **“Sultan”** returned real results (2016 / 2021 / 2022 titles,
-  ratings, series/movie labels).
-- Detail for **“Sultan [Hindi]”** rendered 2016, “2h 50m · Movie”, audio/dub
-  choices, synopsis, and cast.
-- Playback resolved a stream and advanced normally:
-  - `Prahaar…`: controls showed `2:14:01` duration; playback advanced.
-  - `Sultan [Hindi]`: controls showed `0:13 / 2:36:21`; playback advanced,
-    audio track `state:started`, no `PlayerViewModel`/playback errors.
-  - Series `Our Universe`: `0:07 / 0:22`, H.264 decoder active.
-- Error state: airplane mode + force-stop + relaunch produced
-  **“Could not load content — Can't reach the server. Check your internet
-  connection and try again.”** with a Retry button.
-- Recovery: network restored + Retry → home feed loaded again.
-
-Video frames could not be *visually* captured with `adb screencap`: Media3
-`PlayerView` uses a `SurfaceView`, and the emulator's screenshot path returns
-that layer as black. `dumpsys SurfaceFlinger` confirmed the SurfaceView layer
-exists, and decoder/audio/timeline state confirmed playback is running. This is
-a capture/emulator limitation, not evidence of an app playback failure.
+The release dex contains the production origin and no `10.0.2.2` backend
+origin. It still contains generic `http://localhost/` and `127.0.0.1` constants
+inside bundled third-party libraries (Retrofit/Guava helpers); these are not the
+app's configured backend and are not reachable through the release network
+policy.
 
 ---
 
-## 5. Secondary issues discovered
+## 7. Files changed in this fix
 
-### 5.1 Series episodes return a 23-second sample (provider side)
+- `android-app/app/src/main/java/com/streambox/mobile/ui/player/PlayerScreen.kt`
+  — key the `PlayerView` by player identity; explicit binding, layout, detach, and
+  non-secret diagnostics.
+- `android-app/app/src/main/java/com/streambox/mobile/ui/player/PlayerViewModel.kt`
+  — source metadata, native/compat decisions, same-player fallback, first-frame
+  watchdog, true failure-layer diagnostics.
+- `android-app/app/src/main/java/com/streambox/mobile/data/remote/Dtos.kt`
+  — additive stream metadata/compat DTO fields.
+- `android-app/app/src/main/res/xml/network_security_config.xml`
+  — release baseline disables cleartext; local allow-list lives only in debug.
+- `android-app/app/src/debug/res/xml/network_security_config.xml`
+  — debug-only local cleartext exceptions.
+- `android-app/app/src/main/java/com/streambox/mobile/data/update/` and
+  `ui/update/` — direct-APK updater.
+- `android-app/app/src/main/AndroidManifest.xml`, `res/xml/file_paths.xml` —
+  install permission and cache-only FileProvider.
+- `moviebox_api_server.py`, `tests/test_api_contract.py` — `/app-update`,
+  `/app-release.apk`, contract tests.
+- `android-app/app/src/test/java/com/streambox/mobile/data/remote/DtoParsingTest.kt`
+  — metadata and legacy-backend parsing coverage.
+- `android-app/app/src/androidTest/java/com/streambox/mobile/ui/player/VideoRenderingInstrumentedTest.kt`
+  — public HLS rendering test; temporary local compat test removed.
+- `moviebox_api_server.py`
+  — `/stream` metadata and `compatUrl`, `/play-compat` FFmpeg endpoint,
+  SSRF/validation, concurrency, HEAD, disconnect cleanup, retry.
+- `tests/test_api_contract.py`
+  — contract, compatibility, validation, SSRF, and command tests.
+- `README.md`
+  — corrected `/stream` and `/play-compat` contract.
+- `docs/PRODUCTION_FAILURE_REPORT.md`
+  — this report.
 
-For every tested series (`Make Me Tingle`, `The Lament of Autumn`, `Our
-Universe`) and every tested episode (1, 2, 3), the provider's raw
-`play-info` response returned the **same file** with a **23-second duration**,
-and no `signCookie`. The app correctly resolves and plays it (`0:22` total).
-Movies, by contrast, return full-length streams (for example a ~2h30m–2h50m
-movie). The backend's `/stream` reports `duration: 3600` from provider metadata,
-which does not match the 23-second media.
-
-This is not caused by the APK URL bug and cannot be fixed by changing the
-Android client: the provider is returning a preview/sample under the current
-guest credentials. No logged-in MovieBox account was available to determine
-whether this is an entitlement, region, or provider-policy limitation. It is
-reported as an open upstream issue.
-
-### 5.2 Render cold starts are slow but within timeout
-
-First `/health` response took **22.6 s**; later calls were 2.5–9.2 s. The app's
-OkHttp client uses a 45 s read timeout, so the first request succeeds, but a
-slow cold start plus a slow provider call is close to the limit. Retry works.
-No code change was made for this; a longer read timeout or a keep-warm probe
-would be a future improvement, not the root cause.
-
-### 5.3 Unknown detail IDs return HTTP 200 with `code:1`
-
-`GET /detail/{invalid-id}` returns HTTP 200 and `{"code":1,"msg":"Not found"}`.
-The app maps this to a backend error state. This is a contract quirk, not a
-production blocker.
-
-### 5.4 HEVC rendering on the emulator
-
-Most catalog movies are HEVC. The emulator selects
-`c2.goldfish.hevc.decoder`; timeline and audio work, but the surface is black in
-screenshots. Modern physical phones generally have hardware HEVC decoders, but
-this was not verified on the target phone.
+No signed media URLs, cookies, tokens, keystore contents, or signing passwords
+were printed or committed.
 
 ---
 
-## 6. Hypotheses ruled out
-
-| Hypothesis | Verdict | Evidence |
-|---|---|---|
-| Render backend is down or deploy failed | Ruled out | `/health` 200; all app routes 200 |
-| Guest token expired | Ruled out | `/health` shows valid token, expires 2027-01-19 |
-| Missing Render env vars | Ruled out | `/health` reports `status: ok`, would 503 and name missing vars |
-| MovieBox upstream outage | Ruled out | Real trending/home/search/detail/episodes/streams returned |
-| Android INTERNET permission missing | Ruled out | Manifest has `INTERNET`; emulator app reaches production |
-| Cleartext policy blocking the actual request | Not the cause of this APK | The embedded host `10.0.2.2` was allowlisted; failure was unreachable host. LAN-IP HTTP would be blocked. |
-| Wrong endpoint paths or Retrofit URL joining | Ruled out | All live calls used the exact Retrofit paths and returned data |
-| JSON field/type mismatch | Ruled out | Live payload types match DTOs; 15 parsing tests; UI renders live data |
-| Exceptions silently swallowed | Ruled out for connectivity | Airplane-mode test shows explicit error + Retry; Retry recovers |
-| Release signed incorrectly | Ruled out | APK verifies with the Play Dot release certificate |
-| Cold start mistaken for permanent failure | Ruled out | First request succeeded within the 45 s timeout after ~22.6 s |
-| Provider rate limit/block | Not observed | Live calls succeeded consistently during the investigation |
-
----
-
-## 7. Files modified
-
-| File | Change |
-|---|---|
-| `android-app/app/build.gradle.kts` | explicit URL property/env support, trailing-slash normalization, `checkReleaseBaseUrl` release guard |
-| `android-app/app/src/main/java/com/streambox/mobile/StreamBoxApplication.kt` | startup base-URL diagnostic + non-HTTPS warning |
-| `android-app/README.md` | production build command, guard behavior, verified origin |
-| `docs/RENDER_DEPLOYMENT_GUIDE.md` | release build requirements, guard, verified origin |
-| `docs/PRODUCTION_FAILURE_REPORT.md` | this report |
-
-No backend code was changed in this round. No provider credentials, tokens, or
-media URLs were added to the APK or logs.
-
----
-
-## 8. Exact steps to rebuild and reinstall the APK
+## 8. Rebuild and verify
 
 ```bash
 cd android-app
-export JAVA_HOME=/path/to/jdk-17
-export PATH="$JAVA_HOME/bin:$PATH"
 
-# Release build (property or env var; trailing slash optional)
+# Signed release; refuses to run without an explicit public HTTPS origin.
 ./gradlew :app:assembleRelease \
   -Pstreambox.baseUrl=https://play-dot.onrender.com/
 
-# or:
-STREAM_BOX_BASE_URL=https://play-dot.onrender.com/ \
-  ./gradlew :app:assembleRelease
-
-# Verify the embedded URL
+# Verify the embedded backend and signature.
 grep STREAM_BASE_URL \
   app/build/generated/source/buildConfig/release/com/streambox/mobile/BuildConfig.java
 
-# Install on the phone (USB debugging enabled)
-adb install -r app/build/outputs/apk/release/app-release.apk
+$ANDROID_HOME/build-tools/<version>/apksigner verify --print-certs \
+  app/build/outputs/apk/release/app-release.apk
 
-# Launch and watch the startup diagnostic
-adb shell am start -n com.streambox.mobile/.MainActivity
-adb logcat -s PlayDot:V
+sha256sum app/build/outputs/apk/release/app-release.apk
 ```
 
-Expected log line:
+Install the signed APK on the target device:
+
+```bash
+adb install -r app/build/outputs/apk/release/app-release.apk
+adb logcat -s PlayDot:V PlayerViewModel:I PlayerScreen:I
+```
+
+The startup line must say:
 
 ```text
-I/PlayDot: Backend base URL: https://play-dot.onrender.com/ (debug=false)
+Backend base URL: https://play-dot.onrender.com/ (debug=false)
 ```
-
-If installation fails with `INSTALL_FAILED_UPDATE_INCOMPATIBLE`, the phone's
-previous APK was signed with a different key. Uninstall first, which removes
-local watchlist/progress data:
-
-```bash
-adb uninstall com.streambox.mobile
-adb install app/build/outputs/apk/release/app-release.apk
-```
-
-On-phone acceptance checks:
-
-1. Home shows real titles/posters (not the network error).
-2. Search for `Sultan` returns results and opens the detail screen.
-3. Press Play; the timeline advances and video renders (a hardware-decoded
-   movie is the best check; HEVC support depends on the phone).
-4. Enable airplane mode, force-stop and relaunch; confirm the error + Retry
-   screen. Restore network, tap Retry; content should reload.
 
 ---
 
-## 9. Render backend status and redeploy steps
+## 9. Remaining limitations
 
-No backend redeploy is required for this fix. The live service already responds
-at `https://play-dot.onrender.com/` and is running the guest-token-expiry code
-(`e0ced50`; `/health` exposes `guest_token`). The backend tests pass.
-
-If a future backend deployment is needed:
-
-1. Render Dashboard → the service behind `play-dot.onrender.com` (its
-   `/health` identifies itself as `moviebox-internal-api` v1.0.0).
-2. Ensure the environment contains the four required secrets:
-   `MOVIEBOX_GUEST_TOKEN`, `MOVIEBOX_USER_ID`, `MOVIEBOX_GATEWAY_SECRET`,
-   `MOVIEBOX_APPID` (plus the non-secret settings already in `render.yaml`).
-3. Manual Deploy → deploy the desired commit (auto-deploy is off in the
-   checked-in blueprint).
-4. Wait for the deploy and cold start, then verify:
-
-```bash
-curl -sS https://play-dot.onrender.com/health
-curl -sS https://play-dot.onrender.com/trending | head -c 300
-```
-
-Note: the checked-in `render.yaml` names the service `play-dot-api`, while the
-live service identifies as `moviebox-internal-api`. Use the existing Render
-service; do not create a duplicate from the blueprint without checking first.
+- **No physical-device first frame.** All rendering evidence is from the Pixel 7
+  emulator. The release APK's production first frame was rendered there, not on
+  a real phone.
+- **Production compat fallback is not deployed.** `/play-compat` returns `404`
+  and `/stream` lacks `compatUrl` on the live Render service. The current APK's
+  fallback code cannot function in production until the backend is redeployed
+  with FFmpeg. Direct native HEVC is the only verified production path.
+- **No DASH matrix.** No DASH source was available, so DASH behavior is
+  unverified.
+- **No forced reconnect failure.** Buffered playback survived a 12-second
+  network loss; the app's explicit retry/reconnect path was not exercised.
+- **Quality switching, subtitles, HDR, DRM, and audio-route behavior** were not
+  part of this verification.
+- **Backend load/security caveat.** `/play-compat` starts an FFmpeg process per
+  concurrent request and is unauthenticated. The semaphore bounds it, but a
+  public deployment should add edge rate limiting and monitor CPU usage.
 
 ---
 
-## 10. Remaining blockers / not fully verified
+## 10. Final status
 
-1. **No physical phone access.** The release APK was verified on an Android 17
-   emulator, not on the user's phone. The two device-specific checks still
-   outstanding are: install/update with the user's signing key, and visual video
-   rendering on that phone's decoder.
-2. **No Render dashboard/log access.** The investigation used the public HTTPS
-   endpoints only; Render server-side logs were not inspected. All public
-   endpoints responded correctly.
-3. **Series entitlement.** Series episodes return a 23-second sample from the
-   provider under guest credentials. This requires a logged-in/authorized
-   MovieBox account or provider confirmation; it is not an Android/backend bug
-   found in this round.
-4. **Emulator video capture.** SurfaceView frames appear black in `adb screencap`
-   even though playback time, audio state, and decoding advance. Physical-device
-   visual confirmation is required before claiming video rendering is fully
-   verified.
-5. **`/detail` invalid-ID contract.** HTTP 200 + `code:1` is a minor API quirk;
-   the app shows a generic backend error rather than “not found.”
-
----
-
-## 11. Final status
-
-The release URL configuration is fixed, and the Android rendering pipeline has
-now produced a real first video frame from a known H.264/AAC HLS sample on the
-Pixel 7 AVD. The MovieBox provider stream was separately inspected but returned
-HTTP 429 during playback, so no first-frame claim is made for that title. See
-the follow-up below for exact device and stream evidence.
-
-## 12. Follow-up playback verification (2026-10-22)
-
-### Independent Android rendering test
-
-`:app:connectedDebugAndroidTest` ran on the **Pixel 7 AVD (Android 17)** and
-passed its first-frame, track-selection, pause, seek, and resume assertions.
-The test uses the public `https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8`
-HLS sample, not a fabricated backend fixture. Host `ffprobe` reported H.264
-video variants (320×184 through 1920×1080) and AAC stereo audio. Device Logcat
-recorded:
-
-- `Rendered sample video size: 848x480`
-- `First video frame rendered from the public H.264 HLS sample.`
-- Instrumentation result: 1 test, 0 failures, 0 errors.
-
-The test exercises the same TextureView-backed `player_view.xml` used by the
-Compose screen. It verifies Media3 track overrides and player operations, but
-does not synthesize subtitle tracks that the sample does not provide.
-
-### Live MovieBox provider check
-
-The production app loaded the real **“Drishyam: The Conclusion [Hindi][CAM]”**
-catalog entry from `https://play-dot.onrender.com/`. The stream endpoint
-returned a signed MP4 URL on the provider CDN; the signed query was not retained
-in this report. `ffprobe` found **HEVC 1150×480 at 30 fps + AAC 48 kHz stereo**.
-Requests for 480p and 1080p returned the same media URL despite listing both
-quality labels, so those labels did not represent distinct renditions in this
-response. When ExoPlayer tried the provider URL, the CDN returned **HTTP 429**.
-Logcat showed a Media3 source error with response code 429 before decoder
-initialization or `onRenderedFirstFrame`; the app displayed the rate-limit
-message and retry action.
-
-Therefore the provider attempt does **not** establish whether the target
-device's decoder can render that HEVC source, nor whether a separate H.264
-provider rendition exists. Playback should be retried after the provider/CDN
-rate limit clears, or against another currently accessible provider title.
-
-### Code and build verification
-
-- Backend selection now prioritizes explicit provider codec metadata (AVC/H.264
-  before unknown before HEVC); URL suffixes are not treated as codec evidence.
-- The backend no longer returns the first raw candidate after all accessibility
-  probes fail.
-- The Android player now counts 15 seconds of actual READY/playable time toward
-  first-frame timeout, preserving elapsed time across buffering and pausing the
-  timeout while playback is paused. On timeout it stops audio and shows the
-  detected video format with an actionable error.
-- Backend suite: **32 tests passed**.
-- Android unit tests, `connectedDebugAndroidTest`, debug APK, and release APK:
-  **BUILD SUCCESSFUL**.
-- Release APK path: `android-app/app/build/outputs/apk/release/app-release.apk`.
-- Release API base URL: `https://play-dot.onrender.com/`.
-- Latest release APK SHA-256: `228b1ed6c137f3c786a61559d1cc5e6f04b4d87b786ede6f742d0257d7c5276d`.
-
-The sample verifies the Android renderer, while the original provider title
-remains unverified because of its live HTTP 429 and HEVC-only selected response.
-
-## 13. Screenshot follow-up (2026-10-22)
-
-The user-provided screenshot shows that playback time has advanced to
-`55:17 / 2:26:07`, while the app still shows the generic "No video frame has
-rendered" warning. Audio/timeline progress without a rendered frame is not
-successful video playback.
-
-The prior timeout was restarted after each buffering event, which could leave
-the warning visible indefinitely if the stream repeatedly buffers. The latest
-build preserves the remaining timeout across buffering, counts only active
-READY playback time, pauses the timer while paused, and pauses playback with a
-specific codec/resolution error if no first frame arrives after 15 seconds of
-playable time. This is a reporting/diagnostic fix: it cannot convert an
-incompatible or frame-less provider stream into video.
-
-The latest release APK has SHA-256
-`228b1ed6c137f3c786a61559d1cc5e6f04b4d87b786ede6f742d0257d7c5276d`.
-The H.264 sample instrumentation test still passes after this change. The
-provider title in the screenshot has not been re-tested because its previously
-observed CDN response was HTTP 429; its exact codec/decoder failure on the
-user's device is therefore not yet known.
+| Claim | Status |
+|---|---|
+| Root cause identified as Android player/view binding | Verified |
+| Native HEVC renders on emulator after fix | Verified |
+| Native H.264 renders on emulator after fix | Verified |
+| Same-player fallback switches to H.264 and renders | Verified (forced debug path) |
+| Signed release embeds production HTTPS origin | Verified |
+| Signed release renders a production HEVC frame on emulator | Verified |
+| Signed release renders on a physical phone | **Not verified** |
+| Production compatibility fallback available | **No, endpoint 404** |
+| Backend/unit/instrumentation tests pass | Verified |

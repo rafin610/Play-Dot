@@ -39,8 +39,11 @@ android {
         applicationId = "com.streambox.mobile"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "1.0.0-playdot"
+        // 3 / 1.1.0 adds the direct-APK update flow; the applicationId and
+        // release signing key are unchanged so existing installs upgrade
+        // in place.
+        versionCode = 3
+        versionName = "1.1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
         vectorDrawables {

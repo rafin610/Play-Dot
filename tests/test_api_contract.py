@@ -7,10 +7,13 @@ checks are documented separately in docs/FINAL_AUDIT_REPORT.md.
 """
 
 import base64
+import hashlib
 import json
 import os
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -304,6 +307,47 @@ class ApiContractTest(unittest.TestCase):
         self.assertTrue(head.called)
         # TLS verification must not be disabled for the probe.
         self.assertTrue(all(call.kwargs.get("verify") is not False for call in head.call_args_list))
+        # Compatibility metadata is additive and must not replace the native URL.
+        self.assertEqual(
+            "/play-compat/1234567890123456789?season=1&episode=1&quality=720p",
+            payload["compatUrl"],
+        )
+        self.assertEqual("720p", payload["selectedQuality"])
+        self.assertFalse(payload["isTranscoded"])
+        self.assertFalse(payload["isDash"])
+        self.assertEqual("video/mp4", payload["mimeType"])
+
+    def test_stream_does_not_decode_urlprefix_or_bypass_provider_notice(self):
+        class HeadResponse:
+            status_code = 200
+
+        hidden_prefix = base64.urlsafe_b64encode(
+            b"https://hidden.example.test/dash/fixture/"
+        ).decode().rstrip("=")
+        dummy_url = "https://cdn.example.test/video/legacy-notice.mp4"
+        play_info = {
+            "code": 0,
+            "data": {
+                "streamList": [
+                    {
+                        "url": dummy_url,
+                        "quality": "720p",
+                        "signCookie": f"fixture=1; urlprefix={hidden_prefix}:tail",
+                    }
+                ],
+                "subTitleList": [],
+            },
+        }
+        with (
+            patch.object(self.session["stream"], "get_play_info", return_value=play_info),
+            patch("requests.head", return_value=HeadResponse()),
+        ):
+            response = self.client.get("/stream/1234567890123456789")
+
+        self.assertEqual(200, response.status_code)
+        self.assertEqual(dummy_url, response.json()["url"])
+        self.assertNotIn("index.mpd", response.json()["url"])
+        self.assertNotIn("hidden.example.test", response.text)
 
     def test_stream_prefers_metadata_confirmed_h264_over_hevc(self):
         class HeadResponse:
@@ -385,6 +429,94 @@ class ApiContractTest(unittest.TestCase):
         response = self.client.get("/subtitles/search", params={"query": "fixture"})
         self.assertEqual(200, response.status_code)
         self.assertEqual("7", response.json()["data"]["list"][0]["id"])
+
+
+class CompatibilityStreamTest(unittest.TestCase):
+    """Contract tests for the on-demand H.264 compatibility endpoint.
+
+    These stay offline: provider resolution and ffmpeg are patched. A live
+    transcoder check is documented separately because CI has no provider
+    credentials and may not have ffmpeg installed.
+    """
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+
+    def test_compat_head_reports_transcoded_contract(self):
+        with patch("moviebox_api_server.shutil.which", return_value="/usr/bin/ffmpeg"):
+            response = self.client.head(
+                "/play-compat/1234567890123456789",
+                params={"season": 1, "episode": 1, "quality": "480p"},
+            )
+        self.assertEqual(200, response.status_code)
+        self.assertEqual("video/mp4", response.headers["content-type"])
+        self.assertEqual("1", response.headers["x-playdot-transcoded"])
+        self.assertEqual("none", response.headers["accept-ranges"])
+        self.assertEqual("no-store", response.headers["cache-control"])
+
+    def test_compat_rejects_invalid_ids_quality_and_start_time(self):
+        with patch("moviebox_api_server.shutil.which", return_value="/usr/bin/ffmpeg"):
+            bad_id = self.client.head("/play-compat/not-a-number")
+            bad_quality = self.client.head(
+                "/play-compat/123",
+                params={"quality": "8k"},
+            )
+            bad_start = self.client.head(
+                "/play-compat/123",
+                params={"start_time": -1},
+            )
+            bad_resource = self.client.head(
+                "/play-compat/123",
+                params={"resource_id": "../../etc/passwd"},
+            )
+        for response in (bad_id, bad_quality, bad_start, bad_resource):
+            self.assertEqual(400, response.status_code, response.text)
+
+    def test_compat_rejects_private_resolved_source_and_releases_slot(self):
+        private_stream = {
+            "url": "http://127.0.0.1:8000/private.mp4",
+            "cookie": "",
+            "duration": 60,
+        }
+        with (
+            patch.object(server, "get_stream", return_value=private_stream),
+            patch("moviebox_api_server.shutil.which", return_value="/usr/bin/ffmpeg"),
+        ):
+            response = self.client.get("/play-compat/1234567890123456789")
+        self.assertEqual(502, response.status_code)
+        self.assertIn("publicly reachable", response.json()["detail"])
+        # The semaphore must be released on the failure path.
+        self.assertTrue(server._COMPAT_SLOTS.acquire(blocking=False))
+        server._COMPAT_SLOTS.release()
+
+    def test_compat_busy_returns_429_before_resolving(self):
+        self.assertTrue(server._COMPAT_SLOTS.acquire(blocking=False))
+        try:
+            with patch("moviebox_api_server.shutil.which", return_value="/usr/bin/ffmpeg"):
+                response = self.client.get("/play-compat/1234567890123456789")
+            self.assertEqual(429, response.status_code)
+            self.assertIn("busy", response.json()["detail"])
+        finally:
+            server._COMPAT_SLOTS.release()
+
+    def test_compat_ffmpeg_command_is_bounded_h264_mp4(self):
+        with patch("moviebox_api_server.shutil.which", return_value="/usr/bin/ffmpeg"):
+            command = server._build_compat_ffmpeg_command(
+                "https://cdn.example.test/video/fixture.mp4?st=stub",
+                "fixture-sign-cookie",
+                12.5,
+                2,
+            )
+        self.assertIn("-nostdin", command)
+        self.assertIn("-ss", command)
+        self.assertIn("12.500", command)
+        self.assertIn("libx264", command)
+        self.assertIn("scale=-2:480", command)
+        self.assertIn("aac", command)
+        self.assertEqual("mp4", command[command.index("-f") + 1])
+        self.assertEqual("pipe:1", command[-1])
+        self.assertIn("-headers", command)
+        self.assertTrue(command[0].endswith("ffmpeg"))
 
 
 class ConfigurationAndSecurityTest(unittest.TestCase):
@@ -531,6 +663,100 @@ class ConfigurationAndSecurityTest(unittest.TestCase):
                 params={"player": "sh", "url": "https://cdn.example.test/video.mp4"},
             )
         self.assertEqual(400, response.status_code)
+
+
+class AppUpdateContractTest(unittest.TestCase):
+    """Contract tests for the session-independent Android update endpoint."""
+
+    def setUp(self):
+        self.client = TestClient(server.app)
+        # Keep these tests independent of any developer .env file.
+        self.update_env = {
+            "APP_UPDATE_APK_URL": "",
+            "APP_UPDATE_APK_PATH": "",
+            "APP_UPDATE_LATEST_VERSION_CODE": "3",
+            "APP_UPDATE_LATEST_VERSION_NAME": "1.1.0",
+            "APP_UPDATE_MINIMUM_VERSION_CODE": "1",
+            "APP_UPDATE_RELEASE_NOTES": "Playback and stability fixes.",
+            "APP_UPDATE_PACKAGE_NAME": "com.streambox.mobile",
+            "APP_UPDATE_APK_SHA256": "",
+            "APP_UPDATE_APK_SIZE_BYTES": "",
+        }
+
+    def test_unconfigured_update_metadata_is_503(self):
+        with patch.dict(os.environ, self.update_env):
+            response = self.client.get("/app-update")
+        self.assertEqual(503, response.status_code)
+        self.assertIn("not configured", response.json()["detail"])
+
+    def test_https_metadata_has_stable_mobile_contract(self):
+        env = {
+            **self.update_env,
+            "APP_UPDATE_APK_URL": "https://releases.example.test/playdot-1.1.0.apk",
+            "APP_UPDATE_MINIMUM_VERSION_CODE": "2",
+            "APP_UPDATE_APK_SHA256": "a" * 64,
+            "APP_UPDATE_APK_SIZE_BYTES": "123456",
+        }
+        with patch.dict(os.environ, env):
+            response = self.client.get("/app-update")
+        self.assertEqual(200, response.status_code)
+        payload = response.json()
+        self.assertEqual(3, payload["latestVersionCode"])
+        self.assertEqual("1.1.0", payload["latestVersionName"])
+        self.assertEqual(2, payload["minimumSupportedVersionCode"])
+        self.assertEqual("com.streambox.mobile", payload["packageName"])
+        self.assertEqual("https://releases.example.test/playdot-1.1.0.apk", payload["apkUrl"])
+        self.assertEqual("a" * 64, payload["sha256"])
+        self.assertEqual(123456, payload["sizeBytes"])
+        self.assertEqual("no-store", response.headers["cache-control"])
+
+    def test_local_artifact_is_hashed_and_served(self):
+        body = b"signed apk fixture bytes"
+        with tempfile.TemporaryDirectory() as directory:
+            apk = Path(directory) / "app-release.apk"
+            apk.write_bytes(body)
+            env = {
+                **self.update_env,
+                "APP_UPDATE_APK_PATH": str(apk),
+                "APP_UPDATE_APK_URL": "http://localhost:8001/app-release.apk",
+            }
+            with patch.dict(os.environ, env):
+                metadata = self.client.get("/app-update")
+                artifact = self.client.get("/app-release.apk")
+
+        self.assertEqual(200, metadata.status_code)
+        self.assertEqual(hashlib.sha256(body).hexdigest(), metadata.json()["sha256"])
+        self.assertEqual(len(body), metadata.json()["sizeBytes"])
+        self.assertEqual(200, artifact.status_code)
+        self.assertEqual(body, artifact.content)
+        self.assertEqual("application/vnd.android.package-archive", artifact.headers["content-type"])
+
+        with patch.dict(os.environ, self.update_env):
+            missing = self.client.get("/app-release.apk")
+        # An unconfigured route must not leak a local path.
+        self.assertEqual(404, missing.status_code)
+        self.assertNotIn("app-release.apk", missing.json().get("detail", ""))
+
+    def test_public_cleartext_apk_url_is_rejected(self):
+        env = {
+            **self.update_env,
+            "APP_UPDATE_APK_URL": "http://releases.example.test/playdot.apk",
+        }
+        with patch.dict(os.environ, env):
+            response = self.client.get("/app-update")
+        self.assertEqual(503, response.status_code)
+        self.assertIn("invalid APK URL", response.json()["detail"])
+
+    def test_invalid_minimum_version_is_rejected(self):
+        env = {
+            **self.update_env,
+            "APP_UPDATE_APK_URL": "https://releases.example.test/playdot.apk",
+            "APP_UPDATE_MINIMUM_VERSION_CODE": "4",
+        }
+        with patch.dict(os.environ, env):
+            response = self.client.get("/app-update")
+        self.assertEqual(503, response.status_code)
+        self.assertIn("invalid minimum", response.json()["detail"])
 
 
 if __name__ == "__main__":
